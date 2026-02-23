@@ -159,8 +159,8 @@ class ArcAgent:
         for transform, score in top_3:
             print(f"{transform.__name__} with average score {score}")
             test_data = transform(arc_problem._test._input._arc_array)
-            test_data_transformations.append((transform, arc_problem._test._output._arc_array, score))
-            # predictions.append(test_data)
+            test_data_transformations.append((transform, score))
+            predictions.append(test_data)
             print(test_data)
 
         
