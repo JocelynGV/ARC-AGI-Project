@@ -163,62 +163,6 @@ class ArcAgent:
             # predictions.append(test_data)
             print(test_data)
 
-
-
-
-
-        # training_transformations = []
-        # average_score = 0
-        # for transformation in basic_transformations:
-        #     for training in test_data_transformations:
-        #         input_data = training[0](arc_problem._test._input._arc_array)
-        #         output_data = training[1]
-
-        #         transformed = transformation(input_data)
-        #         score = self.combined_score(output_data, transformed)
-        #         average_score += score
-        #     average_score = average_score / len(arc_problem._training_data)
-        #     # print(f"Average score for transformation {transformation.__name__}: {average_score}")
-
-        #     training_transformations.append((transformation, average_score))
-
-        #     average_score = 0
-
-        # # print(training_transformations)
-        # # trim grid 
-        # for training in arc_problem._training_data:
-        #     input_data = training._input._arc_array
-        #     output_data = training._output._arc_array
-
-        #     transformed = self.trim(input_data)
-        #     score = self.combined_score(output_data, transformed)
-        #     average_score += score
- 
-        # average_score = average_score / len(arc_problem._training_data)
-        # training_transformations.append((self.trim, average_score))
-        # average_score = 0
-
-
-        # # swap colors
-        # get_first_two_colors = []
-        # for training in arc_problem._training_data:
-        #     input_data = training._input._arc_array
-        #     output_data = training._output._arc_array
-
-        #     get_first_two_colors = self.top_two_colors(input_data)
-        #     if len(get_first_two_colors) < 2:
-        #         continue
-        #     else: 
-        #         transformed = self.flip_colors(input_data, get_first_two_colors[0], get_first_two_colors[1])
-        #         score = self.combined_score(output_data, transformed)
-        #         average_score += score
-        #         get_first_two_colors = []
-
-        # if len(get_first_two_colors) == 2:
-        #     average_score = average_score / len(arc_problem._training_data)
-        #     training_transformations.append((self.flip_colors, average_score))
-       
-        # average_score = 0
         
         # predictions.append(np.array([
         #     [3,3,3,0],
