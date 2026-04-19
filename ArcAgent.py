@@ -9,6 +9,11 @@ class ArcAgent:
     def __init__(self):
         pass
 
+
+    # ============================================================
+    # MAIN SOLVER
+    # ============================================================
+
     def make_predictions(self, arc_problem: ArcProblem) -> list[np.ndarray]:
 
         print(f"Solving problem {arc_problem._id}")
@@ -24,7 +29,9 @@ class ArcAgent:
             np.array(test_input, copy=True)
         ]
 
+        # =====================================================
         # RULE IDENTIFICATION  (vote across all training pairs)
+        # =====================================================
 
         rule_votes = {}
 
@@ -37,25 +44,19 @@ class ArcAgent:
         identified_rule = max(rule_votes, key=rule_votes.get) if rule_votes else None
         print(f"Identified rule: {identified_rule}")
 
+        # =====================================================
         # HARD-CODED RULE SOLVERS  (highest priority)
+        # =====================================================
 
         RULE_SOLVERS = {
-            "center_recolor":      
-                self.solve_center_recolor,
-            "diagonal_growth":     
-                self.solve_diagonal_growth,
-            "fill_inside_outside": 
-                self.solve_fill_inside_outside,
-            "edge_matching":       
-                self.solve_edge_matching,
-            "direction_growth":    
-                self.solve_direction_growth,
-            "rotation_flip":       
-                self.solve_rotation_flip,
-            "closed_recolor":      
-                self.solve_closed_recolor,
-            "divider_fill":        
-                self.solve_divider_fill,
+            "center_recolor":      self.solve_center_recolor,
+            "diagonal_growth":     self.solve_diagonal_growth,
+            "fill_inside_outside": self.solve_fill_inside_outside,
+            "edge_matching":       self.solve_edge_matching,
+            "direction_growth":    self.solve_direction_growth,
+            "rotation_flip":       self.solve_rotation_flip,
+            "closed_recolor":      self.solve_closed_recolor,
+            "divider_fill":        self.solve_divider_fill,
         }
 
         if identified_rule in RULE_SOLVERS:
@@ -71,14 +72,10 @@ class ArcAgent:
         # =====================================================
 
         basic_transforms = [
-            self.rotate90, 
-            self.rotate180, 
-            self.rotate270,
-            self.flip_horizontal, 
-            self.flip_vertical,
+            self.rotate90, self.rotate180, self.rotate270,
+            self.flip_horizontal, self.flip_vertical,
             self.transpose,
-            self.mirror_left_to_right, 
-            self.mirror_bottom_to_top,
+            self.mirror_left_to_right, self.mirror_bottom_to_top,
             self.mirror_tile_2x2,
             self.mirror_tile_horizontal,
             self.mirror_tile_vertical,
@@ -100,7 +97,9 @@ class ArcAgent:
             score = self.score_transform_on_training(transform, arc_problem)
             transform_scores.append((transform, score))
 
+        # =====================================================
         # GREEDY CHAIN SEARCH
+        # =====================================================
 
         def score_chain(chain):
             total = 0
@@ -111,7 +110,7 @@ class ArcAgent:
                 total += self.combined_score(training._output._arc_array, grid)
             return total / max(len(arc_problem._training_data), 1)
 
-        best_chain = []
+        best_chain       = []
         best_chain_score = score_chain([])
 
         for _ in range(4):
@@ -135,7 +134,18 @@ class ArcAgent:
         apply_chain.__name__ = "apply_chain"
         transform_scores.append((apply_chain, best_chain_score))
 
+        # =====================================================
+        # SEPARATOR ANALYSIS
+        # =====================================================
+
+        panel_comparisons = self.compare_panels_to_output(arc_problem)
+
+        if panel_comparisons:
+            print(f"  Found separator in {len(panel_comparisons)} training example(s)")
+
+        # =====================================================
         # OBJECT RECOLOR + SPATIAL CANDIDATES
+        # =====================================================
 
         for t in self.object_based_candidates(arc_problem):
             score = self.score_transform_on_training(t, arc_problem)
@@ -145,7 +155,18 @@ class ArcAgent:
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
+        # =====================================================
+        # PANEL COMBINATION CANDIDATES
+        # =====================================================
+
+        for t in self._build_panel_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+            print(f"  Panel transform {t.__name__}: {round(score, 4)}")
+
+        # =====================================================
         # RANK ALL CANDIDATES
+        # =====================================================
 
         transform_scores.sort(key=lambda x: x[1], reverse=True)
 
@@ -166,7 +187,10 @@ class ArcAgent:
 
         return predictions
 
+
+    # ============================================================
     # RULE IDENTIFICATION
+    # ============================================================
 
     def identify_rule(self, input_grid, output_grid):
 
@@ -629,8 +653,250 @@ class ArcAgent:
 
         return out
 
+
+    # ============================================================
+    # SEPARATOR DETECTION & PANEL SPLITTING
+    # ============================================================
+
+    def find_separator(self, grid):
+        """
+        Detect a full-width or full-height line of a single non-background color.
+        Returns a dict:
+            {
+                'axis':  'row' | 'col',
+                'index': int,           # row or col index of the separator
+                'color': int,           # separator color
+            }
+        or None if no separator is found.
+        """
+
+        h, w = grid.shape
+        bg   = self.detect_background(grid)
+
+        # check every row
+        for r in range(h):
+            row = grid[r, :]
+            if row[0] != bg and np.all(row == row[0]):
+                return {'axis': 'row', 'index': r, 'color': int(row[0])}
+
+        # check every column
+        for c in range(w):
+            col = grid[:, c]
+            if col[0] != bg and np.all(col == col[0]):
+                return {'axis': 'col', 'index': c, 'color': int(col[0])}
+
+        return None
+
+
+    def split_by_separator(self, grid, separator):
+        """
+        Split a grid into two panels using a detected separator.
+        Returns (panel_a, panel_b) — the two halves, not including the separator line.
+        """
+
+        idx = separator['index']
+
+        if separator['axis'] == 'row':
+            panel_a = grid[:idx, :]
+            panel_b = grid[idx + 1:, :]
+        else:
+            panel_a = grid[:, :idx]
+            panel_b = grid[:, idx + 1:]
+
+        return panel_a, panel_b
+
+
+    def describe_panels(self, grid):
+        """
+        High-level summary of the two panels in a separated grid.
+        Returns a dict with everything downstream transformations need:
+        {
+            'separator':  {...},       # from find_separator
+            'panel_a':    np.ndarray,  # first half
+            'panel_b':    np.ndarray,  # second half
+            'objects_a':  [ArcObject], # objects in panel_a
+            'objects_b':  [ArcObject], # objects in panel_b
+            'colors_a':   set,         # non-background colors in panel_a
+            'colors_b':   set,         # non-background colors in panel_b
+            'shared_colors': set,      # colors present in both panels
+        }
+        or None if no separator exists.
+        """
+
+        sep = self.find_separator(grid)
+        if sep is None:
+            return None
+
+        bg = self.detect_background(grid)
+        panel_a, panel_b = self.split_by_separator(grid, sep)
+
+        # degenerate split — separator was at the edge, one panel is empty
+        if panel_a.size == 0 or panel_b.size == 0:
+            return None
+
+        objs_a = self.find_objects(panel_a)
+        objs_b = self.find_objects(panel_b)
+
+        colors_a = set(np.unique(panel_a)) - {bg}
+        colors_b = set(np.unique(panel_b)) - {bg}
+
+        return {
+            'separator':     sep,
+            'panel_a':       panel_a,
+            'panel_b':       panel_b,
+            'objects_a':     objs_a,
+            'objects_b':     objs_b,
+            'colors_a':      colors_a,
+            'colors_b':      colors_b,
+            'shared_colors': colors_a & colors_b,
+        }
+
+
+    def compare_panels_to_output(self, arc_problem):
+        """
+        For each training example that has a separator, describe both
+        input panels and compare them to the output.  Returns a list of:
+        {
+            'input_panels':  describe_panels() result,
+            'output':        np.ndarray,
+            'output_objects': [ArcObject],
+        }
+        Only includes examples where a separator was found.
+        """
+
+        results = []
+
+        for ex in arc_problem._training_data:
+
+            in_g  = np.array(ex._input._arc_array)
+            out_g = np.array(ex._output._arc_array)
+
+            panels = self.describe_panels(in_g)
+
+            if panels is None:
+                continue
+
+            results.append({
+                'input_panels':   panels,
+                'output':         out_g,
+                'output_objects': self.find_objects(out_g),
+            })
+
+            # debug summary
+            sep = panels['separator']
+            print(f"  Separator: {sep['axis']} {sep['index']} "
+                  f"color={sep['color']}")
+            print(f"  Panel A colors: {panels['colors_a']}")
+            print(f"  Panel B colors: {panels['colors_b']}")
+            print(f"  Shared colors:  {panels['shared_colors']}")
+            print(f"  Output shape:   {out_g.shape}")
+
+        return results
+
+
+    # ============================================================
+    # PANEL COMBINATION TRANSFORMS  (overlap / XOR)
+    # ============================================================
+
+    def _align_panels(self, a, b):
+        """
+        Trim both panels to the same shape (min rows x min cols)
+        so cell-wise operations are always valid.
+        """
+        h = min(a.shape[0], b.shape[0])
+        w = min(a.shape[1], b.shape[1])
+        return a[:h, :w], b[:h, :w]
+
+
+    def panel_overlap(self, grid):
+        """
+        OR — output contains every cell that is filled in either panel.
+        Where both panels have a value, panel_a takes priority.
+        """
+        panels = self.describe_panels(grid)
+        if panels is None:
+            return grid
+
+        bg = self.detect_background(grid)
+        a, b = self._align_panels(panels['panel_a'], panels['panel_b'])
+
+        out = np.where(a != bg, a, b)
+        return out
+
+    def panel_xor(self, grid):
+        """
+        XOR — output cell is filled only when EXACTLY ONE panel has data there.
+        If both panels are filled at that position → output background (empty).
+        If neither is filled → output background.
+        Color of the filled cell is used when only one side is filled.
+        """
+        panels = self.describe_panels(grid)
+        if panels is None:
+            return grid
+
+        bg = self.detect_background(grid)
+        a, b = self._align_panels(panels['panel_a'], panels['panel_b'])
+
+        a_filled = a != bg
+        b_filled = b != bg
+
+        only_a = a_filled & ~b_filled   # filled in A but not B
+        only_b = b_filled & ~a_filled   # filled in B but not A
+
+        out = np.full_like(a, bg)
+        out[only_a] = a[only_a]
+        out[only_b] = b[only_b]
+
+        return out
+
+    def panel_intersection(self, grid):
+        """
+        AND — output cell is filled only when BOTH panels have data there.
+        Panel A's color is used. Useful as a third candidate alongside
+        overlap and XOR.
+        """
+        panels = self.describe_panels(grid)
+        if panels is None:
+            return grid
+
+        bg = self.detect_background(grid)
+        a, b = self._align_panels(panels['panel_a'], panels['panel_b'])
+
+        both_filled = (a != bg) & (b != bg)
+
+        out = np.full_like(a, bg)
+        out[both_filled] = a[both_filled]
+
+        return out
+
+    def _build_panel_candidates(self, arc_problem):
+        """
+        Score all three panel combination transforms and return them
+        as scoreable callables — only added to the pipeline when at
+        least one training example has a separator.
+        """
+
+        panel_transforms = [
+            self.panel_overlap,
+            self.panel_xor,
+            self.panel_intersection,
+        ]
+
+        # only bother if any training example has a separator
+        has_sep = any(
+            self.find_separator(np.array(ex._input._arc_array)) is not None
+            for ex in arc_problem._training_data
+        )
+
+        if not has_sep:
+            return []
+
+        return panel_transforms
+
+    # ============================================================
     # OBJECT RECOLOR CANDIDATES  (scoring-based)
-  
+    # ============================================================
+
     def object_based_candidates(self, arc_problem):
 
         candidates = []
@@ -639,8 +905,8 @@ class ArcAgent:
 
             input_grid  = np.array(example._input._arc_array)
             output_grid = np.array(example._output._arc_array)
-            in_objs = self.find_objects(input_grid)
-            out_objs = self.find_objects(output_grid)
+            in_objs     = self.find_objects(input_grid)
+            out_objs    = self.find_objects(output_grid)
 
             changed = [
                 (o, out_objs[i])
@@ -683,7 +949,10 @@ class ArcAgent:
 
         return candidates
 
+
+    # ============================================================
     # OBJECT SPATIAL CANDIDATES
+    # ============================================================
 
     def object_spatial_candidates(self, arc_problem):
         candidates = []
@@ -860,7 +1129,10 @@ class ArcAgent:
 
         return candidates
 
+
+    # ============================================================
     # SCORING HELPERS
+    # ============================================================
 
     def score_transform_on_training(self, transform, arc_problem):
         total = 0
@@ -889,20 +1161,17 @@ class ArcAgent:
         diff   = sum(abs(d1.get(c, 0) - d2.get(c, 0)) for c in colors)
         return 1 - diff / (2 * max(a.size, 1))
 
-    # GRID TRANSFORMS
 
-    def rotate90(self, g):              
-        return np.rot90(g, 1)
-    def rotate180(self, g):             
-        return np.rot90(g, 2)
-    def rotate270(self, g):             
-        return np.rot90(g, 3)
-    def flip_horizontal(self, g):       
-        return np.fliplr(g)
-    def flip_vertical(self, g):         
-        return np.flipud(g)
-    def transpose(self, g):             
-        return g.T
+    # ============================================================
+    # GRID TRANSFORMS
+    # ============================================================
+
+    def rotate90(self, g):              return np.rot90(g, 1)
+    def rotate180(self, g):             return np.rot90(g, 2)
+    def rotate270(self, g):             return np.rot90(g, 3)
+    def flip_horizontal(self, g):       return np.fliplr(g)
+    def flip_vertical(self, g):         return np.flipud(g)
+    def transpose(self, g):             return g.T
 
     def mirror_tile_2x2(self, g):
         """3x3 → 6x6: tile as [g, fliplr(g)] / [flipud(g), rot180(g)]"""
@@ -967,10 +1236,15 @@ class ArcAgent:
         flip.__name__ = "flip_colors"
         return flip
 
+
+    # ============================================================
     # OBJECT DETECTION
+    # ============================================================
 
     def detect_background(self, grid):
         """Return the most frequent color — that is the background."""
+        if grid.size == 0:
+            return 0
         vals, counts = np.unique(grid, return_counts=True)
         return int(vals[np.argmax(counts)])
 
@@ -1008,7 +1282,10 @@ class ArcAgent:
 
         return objs
 
+
+# ============================================================
 # ARC OBJECT
+# ============================================================
 
 class ArcObject:
 
