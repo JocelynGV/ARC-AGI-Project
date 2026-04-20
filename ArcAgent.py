@@ -165,6 +165,14 @@ class ArcAgent:
             print(f"  Panel transform {t.__name__}: {round(score, 4)}")
 
         # =====================================================
+        # CLOSED OBJECT FILL CANDIDATES
+        # =====================================================
+
+        for t in self._build_closed_fill_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
         # RANK ALL CANDIDATES
         # =====================================================
 
@@ -211,6 +219,11 @@ class ArcAgent:
             if len(out_vals) >= 3:          # shape + 2 fill colors
                 return "fill_inside_outside"
 
+        # Rule 8 — separator divider (check BEFORE edge_matching to avoid
+        # misidentifying the separator column as a border-cell pattern)
+        if self.find_separator(input_grid) is not None:
+            return "divider_fill"
+
         # Rule 4 — edge matching lines
         if self._border_cells_present(input_grid) and self._has_full_rows_or_cols(output_grid):
             return "edge_matching"
@@ -226,10 +239,6 @@ class ArcAgent:
         # Rule 7 — closed shapes get recolored
         if self._closed_shapes_exist(in_objs):
             return "closed_recolor"
-
-        # Rule 8 — red divider, intersect sub-grids
-        if self._divider_present(input_grid):
-            return "divider_fill"
 
         if self._objects_moved(in_objs, out_objs):
             return "object_move"
@@ -565,47 +574,44 @@ class ArcAgent:
     # ============================================================
 
     def solve_closed_recolor(self, grid, arc_problem=None):
-
-        target_color = 8   # cyan default
-
+        """
+        For closed shapes: try ring-fill candidates first (scored against training).
+        Falls back to simple wall recolor if nothing scores well.
+        """
         if arc_problem is not None:
+            candidates = self._build_closed_fill_candidates(arc_problem)
+            if candidates:
+                best_t, best_score = None, -1
+                for t in candidates:
+                    score = self.score_transform_on_training(t, arc_problem)
+                    if score > best_score:
+                        best_score, best_t = score, t
+                if best_t is not None and best_score > 0:
+                    return best_t(grid)
 
+        # fallback: recolor closed shape walls only
+        target_color = 8
+        if arc_problem is not None:
             color_votes = {}
-
             for ex in arc_problem._training_data:
-
-                in_g     = np.array(ex._input._arc_array)
-                out_g    = np.array(ex._output._arc_array)
-                in_objs  = self.find_objects(in_g)
-                out_objs = self.find_objects(out_g)
-
-                # index output objects by top-left corner for fast lookup
-                out_by_pos = {(o.min_row, o.min_col): o for o in out_objs}
-
-                for i_obj in in_objs:
-
+                in_g  = np.array(ex._input._arc_array)
+                out_g = np.array(ex._output._arc_array)
+                out_by_pos = {(o.min_row, o.min_col): o for o in self.find_objects(out_g)}
+                for i_obj in self.find_objects(in_g):
                     if not i_obj.has_hole():
                         continue
-
-                    # find matching output object at the same position
                     o_obj = out_by_pos.get((i_obj.min_row, i_obj.min_col))
-
                     if o_obj is not None and o_obj.color != i_obj.color:
                         color_votes[o_obj.color] = color_votes.get(o_obj.color, 0) + 1
-
             if color_votes:
                 target_color = max(color_votes, key=color_votes.get)
 
-        # open shapes keep their color (grid.copy() baseline)
-        # closed shapes get recolored to target_color
         out = grid.copy()
         for o in self.find_objects(grid):
             if o.has_hole():
                 for r, c in o.cells:
                     out[r, c] = target_color
-
         return out
-
 
     # ============================================================
     # RULE 8 — DIVIDER FILL (intersect sub-grid panels)
@@ -660,7 +666,8 @@ class ArcAgent:
 
     def find_separator(self, grid):
         """
-        Detect a full-width or full-height line of a single non-background color.
+        Detect a full-width or full-height line of a single non-background color
+        that is a minority/accent color (i.e. not the dominant foreground color).
         Returns a dict:
             {
                 'axis':  'row' | 'col',
@@ -673,17 +680,24 @@ class ArcAgent:
         h, w = grid.shape
         bg   = self.detect_background(grid)
 
+        # dominant non-background color — we don't want to treat it as a separator
+        vals, counts = np.unique(grid, return_counts=True)
+        non_bg = [(v, c) for v, c in zip(vals, counts) if v != bg]
+        dominant_fg = max(non_bg, key=lambda x: x[1])[0] if non_bg else None
+
+        # check every column first (more common separator orientation)
+        for c in range(w):
+            col = grid[:, c]
+            color = col[0]
+            if color != bg and color != dominant_fg and np.all(col == color):
+                return {'axis': 'col', 'index': c, 'color': int(color)}
+
         # check every row
         for r in range(h):
             row = grid[r, :]
-            if row[0] != bg and np.all(row == row[0]):
-                return {'axis': 'row', 'index': r, 'color': int(row[0])}
-
-        # check every column
-        for c in range(w):
-            col = grid[:, c]
-            if col[0] != bg and np.all(col == col[0]):
-                return {'axis': 'col', 'index': c, 'color': int(col[0])}
+            color = row[0]
+            if color != bg and color != dominant_fg and np.all(row == color):
+                return {'axis': 'row', 'index': r, 'color': int(color)}
 
         return None
 
@@ -808,10 +822,11 @@ class ArcAgent:
         return a[:h, :w], b[:h, :w]
 
 
-    def panel_overlap(self, grid):
+    def panel_overlap(self, grid, fill_color=1):
         """
-        OR — output contains every cell that is filled in either panel.
-        Where both panels have a value, panel_a takes priority.
+        OR — cell is filled (fill_color) if EITHER panel has a non-bg value there.
+        fill_color defaults to 1; inferred from training by solve_divider_fill /
+        the scored pipeline which picks the best version.
         """
         panels = self.describe_panels(grid)
         if panels is None:
@@ -820,15 +835,14 @@ class ArcAgent:
         bg = self.detect_background(grid)
         a, b = self._align_panels(panels['panel_a'], panels['panel_b'])
 
-        out = np.where(a != bg, a, b)
+        filled = (a != bg) | (b != bg)
+        out = np.where(filled, fill_color, bg)
         return out
 
-    def panel_xor(self, grid):
+    def panel_xor(self, grid, fill_color=1):
         """
-        XOR — output cell is filled only when EXACTLY ONE panel has data there.
-        If both panels are filled at that position → output background (empty).
-        If neither is filled → output background.
-        Color of the filled cell is used when only one side is filled.
+        XOR — output cell is filled (fill_color) only when EXACTLY ONE panel
+        has data there. Both filled or neither filled → background.
         """
         panels = self.describe_panels(grid)
         if panels is None:
@@ -840,20 +854,16 @@ class ArcAgent:
         a_filled = a != bg
         b_filled = b != bg
 
-        only_a = a_filled & ~b_filled   # filled in A but not B
-        only_b = b_filled & ~a_filled   # filled in B but not A
+        exactly_one = a_filled ^ b_filled
 
         out = np.full_like(a, bg)
-        out[only_a] = a[only_a]
-        out[only_b] = b[only_b]
-
+        out[exactly_one] = fill_color
         return out
 
-    def panel_intersection(self, grid):
+    def panel_intersection(self, grid, fill_color=1):
         """
-        AND — output cell is filled only when BOTH panels have data there.
-        Panel A's color is used. Useful as a third candidate alongside
-        overlap and XOR.
+        AND — output cell is filled (fill_color) only when BOTH panels
+        have data there.
         """
         panels = self.describe_panels(grid)
         if panels is None:
@@ -865,22 +875,15 @@ class ArcAgent:
         both_filled = (a != bg) & (b != bg)
 
         out = np.full_like(a, bg)
-        out[both_filled] = a[both_filled]
-
+        out[both_filled] = fill_color
         return out
 
     def _build_panel_candidates(self, arc_problem):
         """
-        Score all three panel combination transforms and return them
-        as scoreable callables — only added to the pipeline when at
-        least one training example has a separator.
+        Build panel combination transforms for every non-background color
+        seen in training outputs, so scoring can find the right fill color.
+        Only runs when at least one training example has a separator.
         """
-
-        panel_transforms = [
-            self.panel_overlap,
-            self.panel_xor,
-            self.panel_intersection,
-        ]
 
         # only bother if any training example has a separator
         has_sep = any(
@@ -891,7 +894,322 @@ class ArcAgent:
         if not has_sep:
             return []
 
-        return panel_transforms
+        # collect candidate fill colors from training outputs
+        fill_colors = set()
+        for ex in arc_problem._training_data:
+            out_g = np.array(ex._output._arc_array)
+            bg    = self.detect_background(out_g)
+            for c in np.unique(out_g):
+                if c != bg:
+                    fill_colors.add(int(c))
+
+        if not fill_colors:
+            fill_colors = {1}
+
+        candidates = []
+        ops = [
+            ("panel_overlap",       self.panel_overlap),
+            ("panel_xor",           self.panel_xor),
+            ("panel_intersection",  self.panel_intersection),
+        ]
+
+        for color in sorted(fill_colors):
+            for name, fn in ops:
+                def make_t(f, c, n):
+                    def t(grid):
+                        return f(grid, fill_color=c)
+                    t.__name__ = f"{n}_fill{c}"
+                    return t
+                candidates.append(make_t(fn, color, name))
+
+        return candidates
+
+    # ============================================================
+    # CLOSED OBJECT FILL  (interior + exterior lining)
+    # ============================================================
+
+    def _flood_fill_region(self, grid, seed_cells, passable_color, h, w):
+        """
+        BFS from seed_cells through cells equal to passable_color.
+        Returns the set of (r,c) reached.
+        """
+        visited = set(seed_cells)
+        queue   = deque(seed_cells)
+        dirs    = [(-1,0),(1,0),(0,-1),(0,1)]
+        while queue:
+            r, c = queue.popleft()
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < h and 0 <= nc < w
+                        and (nr,nc) not in visited
+                        and grid[nr,nc] == passable_color):
+                    visited.add((nr,nc))
+                    queue.append((nr,nc))
+        return visited
+
+
+    def _get_interior_exterior(self, grid, obj, bg):
+        """
+        For a closed ArcObject, return:
+          interior  — set of bg cells enclosed by the object (in global coords)
+          exterior  — set of bg cells reachable from the grid border (global coords)
+
+        Interior is computed locally within the object's bounding box to avoid
+        leaking across other objects on the grid.
+        Exterior is the complement: all bg cells not in the interior.
+        """
+        # --- interior: work in local bounding-box space (same as has_hole) ---
+        shape  = obj.shape_matrix()
+        lh, lw = shape.shape
+        visited = np.zeros((lh, lw), dtype=bool)
+        q       = deque()
+        dirs    = [(-1,0),(1,0),(0,-1),(0,1)]
+
+        # seed flood from edges of the bounding box
+        for r in range(lh):
+            for c in range(lw):
+                if (r in [0, lh-1] or c in [0, lw-1]) and shape[r, c] == 0:
+                    visited[r, c] = True
+                    q.append((r, c))
+
+        while q:
+            r, c = q.popleft()
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if 0 <= nr < lh and 0 <= nc < lw and not visited[nr,nc] and shape[nr,nc] == 0:
+                    visited[nr, nc] = True
+                    q.append((nr, nc))
+
+        # interior = local bg cells not reachable from bounding-box edge
+        interior = {
+            (r + obj.min_row, c + obj.min_col)
+            for r in range(lh) for c in range(lw)
+            if shape[r, c] == 0 and not visited[r, c]
+        }
+
+        # --- exterior: all bg cells on the full grid not in the interior ---
+        obj_cells = set(obj.cells)
+        h, w = grid.shape
+        all_bg = {
+            (r, c) for r in range(h) for c in range(w)
+            if grid[r, c] == bg and (r, c) not in obj_cells and (r, c) not in interior
+        }
+
+        # flood from border to get truly reachable exterior
+        border_seeds = [
+            (r, c) for r in range(h) for c in [0, w-1]
+            if grid[r,c] == bg and (r,c) not in obj_cells
+        ] + [
+            (r, c) for c in range(w) for r in [0, h-1]
+            if grid[r,c] == bg and (r,c) not in obj_cells
+        ]
+        exterior = self._flood_fill_region(grid, border_seeds, bg, h, w) - interior
+
+        return interior, exterior
+
+
+    def _infer_fill_colors(self, arc_problem, bg):
+        """
+        Look at training pairs and infer:
+          wall_color     — color the object walls become (or None = keep)
+          interior_color — color filling the inside hole
+          exterior_color — color filling the outside region
+        Returns a list of (wall_color, interior_color, exterior_color) tuples
+        seen across training, deduplicated.
+        """
+        combos = set()
+
+        for ex in arc_problem._training_data:
+            in_g  = np.array(ex._input._arc_array)
+            out_g = np.array(ex._output._arc_array)
+            in_bg = self.detect_background(in_g)
+
+            for obj in self.find_objects(in_g):
+                if not obj.has_hole():
+                    continue
+
+                interior, exterior = self._get_interior_exterior(in_g, obj, in_bg)
+
+                # sample wall color from output at one of the obj's cells
+                wr, wc = obj.cells[0]
+                wall_c = int(out_g[wr, wc]) if out_g.shape == in_g.shape else None
+
+                # sample interior color
+                int_c = None
+                for (r,c) in interior:
+                    if r < out_g.shape[0] and c < out_g.shape[1]:
+                        int_c = int(out_g[r,c])
+                        break
+
+                # sample exterior color
+                ext_c = None
+                for (r,c) in exterior:
+                    if r < out_g.shape[0] and c < out_g.shape[1]:
+                        v = int(out_g[r,c])
+                        if v != in_bg:          # skip if exterior stays background
+                            ext_c = v
+                            break
+
+                if int_c is not None:
+                    combos.add((wall_c, int_c, ext_c))
+
+        return list(combos) if combos else [(None, 1, None)]
+
+
+    def _outer_ring(self, obj, grid, bg):
+        """
+        New bg cells added OUTSIDE the object: exterior bg cells
+        that are 8-connected (including diagonal) neighbors of the object walls,
+        fully encapsulating the object.
+        """
+        _, exterior = self._get_interior_exterior(grid, obj, bg)
+        obj_set     = set(obj.cells)
+        h, w        = grid.shape
+        dirs        = [(-1,-1),(-1,0),(-1,1),
+                       ( 0,-1),        ( 0,1),
+                       ( 1,-1),( 1,0),( 1,1)]
+        ring        = set()
+        for r, c in obj.cells:
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < h and 0 <= nc < w
+                        and (nr,nc) not in obj_set
+                        and (nr,nc) in exterior):
+                    ring.add((nr,nc))
+        return ring
+
+
+    def _inner_ring(self, obj, grid, bg):
+        """
+        New bg cells added INSIDE the object hole: interior bg cells
+        that are 8-connected (including diagonal) neighbors of the object walls.
+        """
+        interior, _ = self._get_interior_exterior(grid, obj, bg)
+        obj_set     = set(obj.cells)
+        h, w        = grid.shape
+        dirs        = [(-1,-1),(-1,0),(-1,1),
+                       ( 0,-1),        ( 0,1),
+                       ( 1,-1),( 1,0),( 1,1)]
+        ring        = set()
+        for r, c in obj.cells:
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < h and 0 <= nc < w
+                        and (nr,nc) not in obj_set
+                        and (nr,nc) in interior):
+                    ring.add((nr,nc))
+        return ring
+
+
+    def solve_closed_object_fill(self, grid, arc_problem=None,
+                                  outer_color=None,
+                                  inner_color=None,
+                                  wall_color=None):
+        """
+        For every closed object (has_hole), ADD new filled cells:
+          outer_color — bg cells directly outside the object walls get this color
+          inner_color — bg cells directly inside the hole (touching walls) get this color
+          wall_color  — recolor the object walls themselves (None = keep original)
+        Open objects are left untouched.
+        Everything else (non-adjacent bg cells) stays unchanged.
+        """
+        bg  = self.detect_background(grid)
+        out = grid.copy()
+
+        for obj in self.find_objects(grid):
+            if not obj.has_hole():
+                continue
+
+            if outer_color is not None:
+                for r, c in self._outer_ring(obj, grid, bg):
+                    out[r, c] = outer_color
+
+            if inner_color is not None:
+                for r, c in self._inner_ring(obj, grid, bg):
+                    out[r, c] = inner_color
+
+            if wall_color is not None:
+                for r, c in obj.cells:
+                    out[r, c] = wall_color
+
+        return out
+
+
+    def _build_closed_fill_candidates(self, arc_problem):
+        """
+        Build a scored candidate for each (wall, interior, exterior) combo
+        inferred from training, plus a broad sweep of common color combos.
+        Only active when closed shapes exist in training input.
+        """
+
+        has_closed = any(
+            any(o.has_hole() for o in self.find_objects(np.array(ex._input._arc_array)))
+            for ex in arc_problem._training_data
+        )
+
+        if not has_closed:
+            return []
+
+        bg = self.detect_background(
+            np.array(arc_problem._training_data[0]._input._arc_array)
+        )
+
+        # infer from training
+        inferred = self._infer_fill_colors(arc_problem, bg)
+
+        # also collect all non-bg colors from training outputs as candidates
+        output_colors = set()
+        for ex in arc_problem._training_data:
+            out_g = np.array(ex._output._arc_array)
+            out_bg = self.detect_background(out_g)
+            for v in np.unique(out_g):
+                if v != out_bg:
+                    output_colors.add(int(v))
+
+        # build full combo list: inferred + sweeps
+        combos = list(inferred)
+        for ic in output_colors:
+            combos.append((None, ic, None))           # interior only
+            for ec in output_colors:
+                if ec != ic:
+                    combos.append((None, ic, ec))     # interior + exterior
+
+        # deduplicate
+        combos = list(dict.fromkeys(combos))
+
+        candidates = []
+
+        # generate all combinations of outer/inner/wall colors
+        # None means "don't touch those cells"
+        color_opts = [None] + sorted(output_colors)
+
+        seen_names = set()
+        for wall_c, int_c, ext_c in combos:
+            # int_c → inner ring, ext_c → outer ring
+            for outer_c in [ext_c, None]:
+                for inner_c in [int_c, None]:
+                    if outer_c is None and inner_c is None:
+                        continue  # nothing to add
+                    def make_t(oc, ic, wc):
+                        def t(grid):
+                            return self.solve_closed_object_fill(
+                                grid, arc_problem,
+                                outer_color=oc,
+                                inner_color=ic,
+                                wall_color=wc,
+                            )
+                        parts = []
+                        if oc is not None: parts.append(f"outer{oc}")
+                        if ic is not None: parts.append(f"inner{ic}")
+                        if wc is not None: parts.append(f"wall{wc}")
+                        t.__name__ = "closed_fill_" + "_".join(parts)
+                        return t
+                    name = f"{outer_c}_{inner_c}_{wall_c}"
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        candidates.append(make_t(outer_c, inner_c, wall_c))
+
+        return candidates
 
     # ============================================================
     # OBJECT RECOLOR CANDIDATES  (scoring-based)
@@ -1242,8 +1560,14 @@ class ArcAgent:
     # ============================================================
 
     def detect_background(self, grid):
-        """Return the most frequent color — that is the background."""
+        """
+        Return the background color.
+        0 is always treated as background if it appears in the grid.
+        Otherwise fall back to the most frequent color.
+        """
         if grid.size == 0:
+            return 0
+        if np.any(grid == 0):
             return 0
         vals, counts = np.unique(grid, return_counts=True)
         return int(vals[np.argmax(counts)])
