@@ -173,6 +173,22 @@ class ArcAgent:
             transform_scores.append((t, score))
 
         # =====================================================
+        # INTERIOR MAJORITY FILL CANDIDATES
+        # =====================================================
+
+        for t in self._build_interior_majority_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # NOISE-STRIPPED VARIANTS OF CLOSE CANDIDATES
+        # =====================================================
+
+        for t in self._build_noise_stripped_candidates(arc_problem, transform_scores):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
         # RANK ALL CANDIDATES
         # =====================================================
 
@@ -720,6 +736,23 @@ class ArcAgent:
         return panel_a, panel_b
 
 
+    def split_by_halving(self, grid):
+        """
+        Split the grid into two equal halves along the longer axis.
+        Returns (panel_a, panel_b, axis) where axis is 'row' or 'col'.
+        If the grid is square, splits by columns (left/right).
+        """
+        h, w = grid.shape
+        if h >= w:
+            # taller — split top / bottom
+            mid = h // 2
+            return grid[:mid, :], grid[mid:, :], 'row'
+        else:
+            # wider — split left / right
+            mid = w // 2
+            return grid[:, :mid], grid[:, mid:], 'col'
+
+
     def describe_panels(self, grid):
         """
         High-level summary of the two panels in a separated grid.
@@ -738,15 +771,18 @@ class ArcAgent:
         """
 
         sep = self.find_separator(grid)
+        bg  = self.detect_background(grid)
+
+        if sep is not None:
+            panel_a, panel_b = self.split_by_separator(grid, sep)
+            # degenerate split — separator at edge, one panel empty
+            if panel_a.size == 0 or panel_b.size == 0:
+                sep = None
+
         if sep is None:
-            return None
-
-        bg = self.detect_background(grid)
-        panel_a, panel_b = self.split_by_separator(grid, sep)
-
-        # degenerate split — separator was at the edge, one panel is empty
-        if panel_a.size == 0 or panel_b.size == 0:
-            return None
+            # no separator — fall back to halving along the longer axis
+            panel_a, panel_b, axis = self.split_by_halving(grid)
+            sep = {'axis': axis, 'index': None, 'color': None, 'halved': True}
 
         objs_a = self.find_objects(panel_a)
         objs_b = self.find_objects(panel_b)
@@ -881,18 +917,16 @@ class ArcAgent:
     def _build_panel_candidates(self, arc_problem):
         """
         Build panel combination transforms for every non-background color
-        seen in training outputs, so scoring can find the right fill color.
-        Only runs when at least one training example has a separator.
+        seen in training outputs.
+        - If a separator exists: use separator-based split (tagged 'sep').
+        - Always also try halving split (tagged 'halved') as a fallback.
+        Scoring picks whichever wins.
         """
 
-        # only bother if any training example has a separator
         has_sep = any(
             self.find_separator(np.array(ex._input._arc_array)) is not None
             for ex in arc_problem._training_data
         )
-
-        if not has_sep:
-            return []
 
         # collect candidate fill colors from training outputs
         fill_colors = set()
@@ -908,19 +942,49 @@ class ArcAgent:
 
         candidates = []
         ops = [
-            ("panel_overlap",       self.panel_overlap),
-            ("panel_xor",           self.panel_xor),
-            ("panel_intersection",  self.panel_intersection),
+            ("overlap", self.panel_overlap),
+            ("xor",     self.panel_xor),
+            ("and",     self.panel_intersection),
         ]
 
         for color in sorted(fill_colors):
-            for name, fn in ops:
-                def make_t(f, c, n):
+            for op_name, fn in ops:
+
+                # separator-based (only when separator detected)
+                if has_sep:
+                    def make_sep(f, c, n):
+                        def t(grid):
+                            return f(grid, fill_color=c)
+                        t.__name__ = f"sep_{n}_fill{c}"
+                        return t
+                    candidates.append(make_sep(fn, color, op_name))
+
+                # halving-based (always — forced split along longer axis)
+                def make_halved(f, c, n):
                     def t(grid):
-                        return f(grid, fill_color=c)
-                    t.__name__ = f"{n}_fill{c}"
+                        h, w = grid.shape
+                        bg   = self.detect_background(grid)
+                        if h >= w:
+                            mid = h // 2
+                            panel_a, panel_b = grid[:mid, :], grid[mid:, :]
+                        else:
+                            mid = w // 2
+                            panel_a, panel_b = grid[:, :mid], grid[:, mid:]
+                        a, b = self._align_panels(panel_a, panel_b)
+                        a_filled = a != bg
+                        b_filled = b != bg
+                        if n == "overlap":
+                            mask = a_filled | b_filled
+                        elif n == "xor":
+                            mask = a_filled ^ b_filled
+                        else:  # and
+                            mask = a_filled & b_filled
+                        out = np.full_like(a, bg)
+                        out[mask] = c
+                        return out
+                    t.__name__ = f"halved_{n}_fill{c}"
                     return t
-                candidates.append(make_t(fn, color, name))
+                candidates.append(make_halved(fn, color, op_name))
 
         return candidates
 
@@ -1100,6 +1164,146 @@ class ArcAgent:
                     ring.add((nr,nc))
         return ring
 
+
+    def _interior_majority_color(self, obj, grid, bg):
+        """
+        Return the most common non-background color found inside the
+        object's hole, or None if the interior contains only background.
+        """
+        interior, _ = self._get_interior_exterior(grid, obj, bg)
+        if not interior:
+            return None
+
+        color_counts = {}
+        for r, c in interior:
+            v = grid[r, c]
+            if v != bg:
+                color_counts[v] = color_counts.get(v, 0) + 1
+
+        if not color_counts:
+            return None
+
+        return max(color_counts, key=color_counts.get)
+
+
+    def _all_interior_cells(self, obj):
+        """
+        Return every cell inside the object's bounding box that is NOT
+        a wall cell — i.e. all cells enclosed by the shape, regardless
+        of what color they currently are (bg or otherwise).
+        This is derived from shape_matrix so it never leaks to other objects.
+        """
+        shape    = obj.shape_matrix()
+        lh, lw   = shape.shape
+        visited  = np.zeros((lh, lw), dtype=bool)
+        q        = deque()
+        dirs     = [(-1,0),(1,0),(0,-1),(0,1)]
+
+        # flood from bounding-box edges to find exterior-of-hole cells
+        for r in range(lh):
+            for c in range(lw):
+                if (r in [0, lh-1] or c in [0, lw-1]) and shape[r,c] == 0:
+                    visited[r,c] = True
+                    q.append((r,c))
+
+        while q:
+            r, c = q.popleft()
+            for dr, dc in dirs:
+                nr, nc = r+dr, c+dc
+                if 0<=nr<lh and 0<=nc<lw and not visited[nr,nc] and shape[nr,nc] == 0:
+                    visited[nr,nc] = True
+                    q.append((nr,nc))
+
+        # every non-wall cell not reached = inside the hole
+        return [
+            (r + obj.min_row, c + obj.min_col)
+            for r in range(lh) for c in range(lw)
+            if not visited[r,c] and shape[r,c] == 0
+        ]
+
+
+    def solve_interior_majority_fill(self, grid, arc_problem=None):
+        """
+        For every closed object whose interior contains at least one
+        non-background cell:
+          - Find the majority non-background color inside the hole.
+          - Overwrite EVERY interior cell (including other colors) with it.
+        Objects whose interiors are all background are left untouched.
+        Walls are NOT recolored — only the cells inside the hole.
+        """
+        bg  = self.detect_background(grid)
+        out = grid.copy()
+
+        for obj in self.find_objects(grid):
+            if not obj.has_hole():
+                continue
+
+            fill_color = self._interior_majority_color(obj, grid, bg)
+            if fill_color is None:
+                continue
+
+            # overwrite every cell inside the hole, whatever color it is
+            for r, c in self._all_interior_cells(obj):
+                out[r, c] = fill_color
+
+        return out
+
+
+    def _build_interior_majority_candidates(self, arc_problem):
+        """
+        Returns the interior-majority-fill transform if any training input
+        has a closed object with non-background cells inside it.
+        Also tries variants that additionally apply the outer/inner ring fill
+        on top, scored against training to find the best combo.
+        """
+        has_candidate = False
+        for ex in arc_problem._training_data:
+            in_g = np.array(ex._input._arc_array)
+            bg   = self.detect_background(in_g)
+            for obj in self.find_objects(in_g):
+                if obj.has_hole() and self._interior_majority_color(obj, in_g, bg) is not None:
+                    has_candidate = True
+                    break
+            if has_candidate:
+                break
+
+        if not has_candidate:
+            return []
+
+        candidates = []
+
+        # base: just fill the interior with majority color
+        def majority_fill(grid):
+            return self.solve_interior_majority_fill(grid, arc_problem)
+        majority_fill.__name__ = "interior_majority_fill"
+        candidates.append(majority_fill)
+
+        # combos: majority fill + outer ring in each output color
+        output_colors = set()
+        for ex in arc_problem._training_data:
+            out_g  = np.array(ex._output._arc_array)
+            out_bg = self.detect_background(out_g)
+            for v in np.unique(out_g):
+                if v != out_bg:
+                    output_colors.add(int(v))
+
+        for oc in sorted(output_colors):
+            def make_t(outer_c):
+                def t(grid):
+                    # first fill interior with majority color
+                    g = self.solve_interior_majority_fill(grid, arc_problem)
+                    # then add outer ring
+                    bg2 = self.detect_background(grid)
+                    for obj in self.find_objects(grid):
+                        if obj.has_hole():
+                            for r, c in self._outer_ring(obj, grid, bg2):
+                                g[r, c] = outer_c
+                    return g
+                t.__name__ = f"interior_majority_fill_outer{outer_c}"
+                return t
+            candidates.append(make_t(oc))
+
+        return candidates
 
     def solve_closed_object_fill(self, grid, arc_problem=None,
                                   outer_color=None,
@@ -1451,6 +1655,80 @@ class ArcAgent:
     # ============================================================
     # SCORING HELPERS
     # ============================================================
+
+    def _strip_single_pixels(self, grid):
+        """
+        Remove isolated single-pixel objects (size == 1) from the grid,
+        replacing them with background. Open multi-cell objects are kept.
+        Closed objects are kept.
+        """
+        bg   = self.detect_background(grid)
+        out  = grid.copy()
+        objs = self.find_objects(grid)
+        for o in objs:
+            if o.size == 1:
+                r, c = o.cells[0]
+                out[r, c] = bg
+        return out
+
+
+    def _with_noise_strip(self, base_transform, arc_problem, threshold=0.6):
+        """
+        Returns a wrapped transform that:
+          1. Applies base_transform to get result A.
+          2. Strips isolated single pixels from A to get result B.
+          3. Scores A and B against training.
+          4. Returns whichever scores higher.
+
+        Only activates if the base score exceeds `threshold` — below that
+        the transform isn't close enough for noise-stripping to be meaningful.
+        """
+        def wrapped(grid):
+            result_a = base_transform(grid)
+            result_b = self._strip_single_pixels(result_a)
+
+            # score both against training
+            score_a, score_b = 0.0, 0.0
+            n = max(len(arc_problem._training_data), 1)
+
+            for ex in arc_problem._training_data:
+                in_g  = np.array(ex._input._arc_array, copy=True)
+                out_g = ex._output._arc_array
+                try:
+                    pred_a = base_transform(in_g)
+                    score_a += self.combined_score(out_g, pred_a)
+                except Exception:
+                    pass
+                try:
+                    pred_b = self._strip_single_pixels(pred_a if 'pred_a' in dir() else in_g)
+                    score_b += self.combined_score(out_g, pred_b)
+                except Exception:
+                    pass
+
+            score_a /= n
+            score_b /= n
+
+            # only bother if the base is reasonably close
+            if score_a < threshold:
+                return result_a
+
+            return result_b if score_b > score_a else result_a
+
+        wrapped.__name__ = f"{base_transform.__name__}_stripped"
+        return wrapped
+
+
+    def _build_noise_stripped_candidates(self, arc_problem, transform_scores, threshold=0.6):
+        """
+        For every existing candidate that scores above `threshold`,
+        generate a noise-stripped variant and add it to the pool.
+        """
+        candidates = []
+        for transform, score in transform_scores:
+            if score >= threshold and not transform.__name__.endswith("_stripped"):
+                wrapped = self._with_noise_strip(transform, arc_problem, threshold)
+                candidates.append(wrapped)
+        return candidates
 
     def score_transform_on_training(self, transform, arc_problem):
         total = 0
