@@ -181,6 +181,14 @@ class ArcAgent:
             transform_scores.append((t, score))
 
         # =====================================================
+        # INTERIOR REFLECTION CANDIDATES
+        # =====================================================
+
+        for t in self._build_interior_reflection_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
         # NOISE-STRIPPED VARIANTS OF CLOSE CANDIDATES
         # =====================================================
 
@@ -1651,6 +1659,118 @@ class ArcAgent:
 
         return candidates
 
+
+    # ============================================================
+    # INTERIOR REFLECTION
+    # ============================================================
+
+    def _reflect_interior(self, grid, obj, bg, mode="both"):
+        """
+        Reflect the non-background content inside a closed object's hole
+        onto the opposite side of the interior.
+
+        mode options:
+          "horizontal" — flip left↔right inside the hole
+          "vertical"   — flip top↔bottom inside the hole
+          "both"       — rotate 180° inside the hole (flip both axes)
+
+        Non-background interior cells are copied to their reflected position.
+        The reflected position overwrites whatever was there.
+        Wall cells are never touched.
+        """
+        all_interior = set(self._all_interior_cells(obj))
+        if not all_interior:
+            return grid
+
+        rows = [r for r, c in all_interior]
+        cols = [c for r, c in all_interior]
+        min_r, max_r = min(rows), max(rows)
+        min_c, max_c = min(cols), max(cols)
+
+        out = grid.copy()
+
+        for r, c in all_interior:
+            v = grid[r, c]
+            if v == bg:
+                continue  # only reflect filled cells
+
+            if mode == "horizontal":
+                nr, nc = r, min_c + max_c - c
+            elif mode == "vertical":
+                nr, nc = min_r + max_r - r, c
+            else:  # both / 180
+                nr, nc = min_r + max_r - r, min_c + max_c - c
+
+            if (nr, nc) in all_interior:
+                out[nr, nc] = v
+
+        return out
+
+
+    def solve_interior_reflection(self, grid, mode="both"):
+        """
+        For every closed object, reflect the non-bg interior content
+        across the hole's center using the given mode.
+        """
+        bg  = self.detect_background(grid)
+        out = grid.copy()
+
+        for obj in self.find_objects(grid):
+            if not obj.has_hole():
+                continue
+
+            # check there's anything non-bg inside
+            interior_cells = self._all_interior_cells(obj)
+            if not any(grid[r, c] != bg for r, c in interior_cells):
+                continue
+
+            out = self._reflect_interior(out, obj, bg, mode=mode)
+
+        return out
+
+
+    def _build_interior_reflection_candidates(self, arc_problem):
+        """
+        Generate reflection candidates for each mode.
+        Only active when at least one training input has a closed object
+        with non-background content inside.
+        """
+        has_filled_interior = False
+        for ex in arc_problem._training_data:
+            in_g = np.array(ex._input._arc_array)
+            bg   = self.detect_background(in_g)
+            for obj in self.find_objects(in_g):
+                if not obj.has_hole():
+                    continue
+                if any(in_g[r, c] != bg for r, c in self._all_interior_cells(obj)):
+                    has_filled_interior = True
+                    break
+            if has_filled_interior:
+                break
+
+        if not has_filled_interior:
+            return []
+
+        candidates = []
+        for mode in ["both", "horizontal", "vertical"]:
+            def make_t(m):
+                def t(grid):
+                    return self.solve_interior_reflection(grid, mode=m)
+                t.__name__ = f"interior_reflect_{m}"
+                return t
+            candidates.append(make_t(mode))
+
+            # also try reflection THEN majority fill — covers cases where
+            # the reflection completes a pattern that gets flood-filled
+            def make_reflect_then_fill(m):
+                def t(grid):
+                    reflected = self.solve_interior_reflection(grid, mode=m)
+                    return self.solve_interior_majority_fill(reflected)
+                t.__name__ = f"interior_reflect_{m}_then_fill"
+                return t
+            candidates.append(make_reflect_then_fill(mode))
+
+        return candidates
 
     # ============================================================
     # SCORING HELPERS
