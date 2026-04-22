@@ -82,6 +82,9 @@ class ArcAgent:
             self.invert_majority_color,
             self.trim,
             self.diagonal_x_fill,
+            self.hollow_objects,
+            self.trim_and_flip_colors,
+            self.swap_gray_and_color,
         ]
 
         color_flip = self.build_dynamic_color_flip(arc_problem)
@@ -202,6 +205,24 @@ class ArcAgent:
         # =====================================================
 
         for t in self._build_spiral_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # EXPAND DOTS TO 3×3 BLOCKS
+        # =====================================================
+
+        for t in self._build_expand_dots_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # HOLLOW + TRIM-FLIP + SWAP-GRAY (basic scored)
+        # =====================================================
+
+        for t in [self.hollow_objects,
+                  self.trim_and_flip_colors,
+                  self.swap_gray_and_color]:
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
@@ -939,6 +960,25 @@ class ArcAgent:
         out[both_filled] = fill_color
         return out
 
+
+    def panel_neither(self, grid, fill_color=1):
+        """
+        NOR — output cell is filled (fill_color) only when NEITHER panel
+        has data there (both are background).
+        """
+        panels = self.describe_panels(grid)
+        if panels is None:
+            return grid
+
+        bg = self.detect_background(grid)
+        a, b = self._align_panels(panels['panel_a'], panels['panel_b'])
+
+        neither_filled = (a == bg) & (b == bg)
+
+        out = np.full_like(a, bg)
+        out[neither_filled] = fill_color
+        return out
+
     def _build_panel_candidates(self, arc_problem):
         """
         Build panel combination transforms for every non-background color
@@ -967,9 +1007,10 @@ class ArcAgent:
 
         candidates = []
         ops = [
-            ("overlap", self.panel_overlap),
-            ("xor",     self.panel_xor),
-            ("and",     self.panel_intersection),
+            ("overlap",  self.panel_overlap),
+            ("xor",      self.panel_xor),
+            ("and",      self.panel_intersection),
+            ("neither",  self.panel_neither),
         ]
 
         for color in sorted(fill_colors):
@@ -1002,6 +1043,8 @@ class ArcAgent:
                             mask = a_filled | b_filled
                         elif n == "xor":
                             mask = a_filled ^ b_filled
+                        elif n == "neither":
+                            mask = (~a_filled) & (~b_filled)
                         else:  # and
                             mask = a_filled & b_filled
                         out = np.full_like(a, bg)
@@ -1788,6 +1831,177 @@ class ArcAgent:
             candidates.append(make_reflect_then_fill(mode))
 
         return candidates
+
+    # ============================================================
+    # HOLLOW OBJECTS
+    # ============================================================
+
+    def hollow_objects(self, grid):
+        """
+        For every non-background object, keep only its outermost shell —
+        any cell whose 4 in-bounds neighbors are all the same color becomes
+        background (interior cleared).  Works on any solid filled shape.
+        """
+        bg  = self.detect_background(grid)
+        out = grid.copy()
+        h, w = grid.shape
+        dirs4 = [(-1,0),(1,0),(0,-1),(0,1)]
+        visited = np.zeros((h,w), dtype=bool)
+
+        for r in range(h):
+            for c in range(w):
+                if visited[r,c] or grid[r,c] == bg:
+                    continue
+                color = grid[r,c]
+                q = deque([(r,c)]); visited[r,c] = True; cells = []
+                while q:
+                    cr,cc = q.popleft(); cells.append((cr,cc))
+                    for dr,dc in dirs4:
+                        nr,nc = cr+dr,cc+dc
+                        if (0<=nr<h and 0<=nc<w
+                                and not visited[nr,nc]
+                                and grid[nr,nc]==color):
+                            visited[nr,nc]=True; q.append((nr,nc))
+
+                cell_set = set(cells)
+                for r2,c2 in cells:
+                    # interior = every in-bounds 4-neighbor is also a wall cell
+                    all_nbrs_filled = all(
+                        grid[r2+dr,c2+dc] == color
+                        for dr,dc in dirs4
+                        if 0<=r2+dr<h and 0<=c2+dc<w
+                    )
+                    on_grid_edge = (r2==0 or r2==h-1 or c2==0 or c2==w-1)
+                    if all_nbrs_filled and not on_grid_edge:
+                        out[r2,c2] = bg
+
+        return out
+
+
+    # ============================================================
+    # TRIM + COLOR FLIP
+    # ============================================================
+
+    def trim_and_flip_colors(self, grid):
+        """
+        Trim background border, then swap the two most common non-background
+        colors — e.g. 3→8 and 8→3 inside the cropped region.
+        """
+        bg   = self.detect_background(grid)
+        rows = np.any(grid != bg, axis=1)
+        cols = np.any(grid != bg, axis=0)
+        trimmed = grid[rows][:,cols]
+
+        vals = [int(v) for v in np.unique(trimmed) if v != bg]
+        if len(vals) < 2:
+            return trimmed
+
+        out = trimmed.copy()
+        a, b = vals[0], vals[1]
+        out[trimmed==a] = b
+        out[trimmed==b] = a
+        return out
+
+
+    # ============================================================
+    # EXPAND SINGLE CELLS TO 3×3 BLOCKS
+    # ============================================================
+
+    def expand_dots_to_blocks(self, grid):
+        """
+        Each isolated non-background cell becomes a 3×3 filled block
+        centered on it.  Fill color is inferred as the most common
+        non-background, non-source color in training outputs; defaults
+        to 1 if none found.
+        """
+        bg        = self.detect_background(grid)
+        src_color = None
+        for v in np.unique(grid):
+            if v != bg:
+                src_color = int(v); break
+
+        # fill color = 1 unless overridden by caller via _build_expand_dots_candidates
+        fill_color = 1
+        out = np.full_like(grid, bg)
+        h, w = grid.shape
+
+        for r in range(h):
+            for c in range(w):
+                if grid[r,c] != bg:
+                    for dr in range(-1,2):
+                        for dc in range(-1,2):
+                            nr,nc = r+dr,c+dc
+                            if 0<=nr<h and 0<=nc<w:
+                                out[nr,nc] = fill_color
+        return out
+
+
+    def _build_expand_dots_candidates(self, arc_problem):
+        """
+        Try expand_dots_to_blocks with every non-background output color.
+        Only activates when inputs contain isolated single cells.
+        """
+        has_singles = any(
+            any(o.size==1 for o in self.find_objects(np.array(ex._input._arc_array)))
+            for ex in arc_problem._training_data
+        )
+        if not has_singles:
+            return []
+
+        fill_colors = set()
+        for ex in arc_problem._training_data:
+            out_g = np.array(ex._output._arc_array)
+            bg    = self.detect_background(out_g)
+            for v in np.unique(out_g):
+                if v != bg: fill_colors.add(int(v))
+
+        if not fill_colors: fill_colors = {1}
+
+        candidates = []
+        for fc in sorted(fill_colors):
+            def make_t(c):
+                def t(grid):
+                    bg2 = self.detect_background(grid)
+                    out = np.full_like(grid, bg2)
+                    h, w = grid.shape
+                    for r in range(h):
+                        for cc in range(w):
+                            if grid[r,cc] != bg2:
+                                for dr in range(-1,2):
+                                    for dc in range(-1,2):
+                                        nr,nc = r+dr,cc+dc
+                                        if 0<=nr<h and 0<=nc<w:
+                                            out[nr,nc] = c
+                    return out
+                t.__name__ = f"expand_dots_fill{c}"
+                return t
+            candidates.append(make_t(fc))
+        return candidates
+
+
+    # ============================================================
+    # SWAP GRAY (5) AND COLOR
+    # ============================================================
+
+    def swap_gray_and_color(self, grid):
+        """
+        Cells with value 5 (gray) → become the dominant non-gray color.
+        Cells with the dominant non-gray color → become 0 (black/background).
+        5 is always treated as gray regardless of frequency.
+        """
+        gray = 5
+        # dominant non-gray color = most frequent value that isn't 5
+        vals, counts = np.unique(grid, return_counts=True)
+        non_gray = [(int(v), int(c)) for v,c in zip(vals,counts) if v != gray]
+        if not non_gray:
+            return grid.copy()
+        color = max(non_gray, key=lambda x: x[1])[0]
+
+        out = np.zeros_like(grid)          # black background
+        out[grid==gray] = color            # gray → color
+        # colored cells → 0 (already 0 from np.zeros_like)
+        return out
+
 
     # ============================================================
     # SCORING HELPERS
