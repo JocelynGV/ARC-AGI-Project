@@ -81,6 +81,7 @@ class ArcAgent:
             self.mirror_tile_vertical,
             self.invert_majority_color,
             self.trim,
+            self.diagonal_x_fill,
         ]
 
         color_flip = self.build_dynamic_color_flip(arc_problem)
@@ -185,6 +186,22 @@ class ArcAgent:
         # =====================================================
 
         for t in self._build_interior_reflection_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # DIAGONAL X FILL CANDIDATES
+        # =====================================================
+
+        for t in self._build_diagonal_x_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # SPIRAL FILL CANDIDATES
+        # =====================================================
+
+        for t in self._build_spiral_candidates(arc_problem):
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
@@ -1914,6 +1931,167 @@ class ArcAgent:
         for i in range(g.shape[0] // 2):
             new[i] = g[g.shape[0] - 1 - i]
         return new
+
+    def diagonal_x_fill(self, g):
+        """
+        For every non-background cell, draw diagonals in all 4 directions
+        (↖ ↗ ↙ ↘) until the grid edge, painting with that cell's color.
+        Existing non-background cells are never overwritten.
+        """
+        bg  = self.detect_background(g)
+        out = g.copy()
+        h, w = g.shape
+        dirs = [(-1,-1), (-1,1), (1,-1), (1,1)]
+        for r in range(h):
+            for c in range(w):
+                if g[r, c] == bg:
+                    continue
+                color = g[r, c]
+                for dr, dc in dirs:
+                    nr, nc = r + dr, c + dc
+                    while 0 <= nr < h and 0 <= nc < w:
+                        if out[nr, nc] == bg:
+                            out[nr, nc] = color
+                        nr += dr
+                        nc += dc
+        return out
+
+
+    def _spiral_path(self, h, w):
+        """
+        Generate the full clockwise inward spiral path for an h×w grid,
+        starting at (0,0) going right.  Returns list of (r,c) in order.
+        """
+        visited = np.zeros((h, w), dtype=bool)
+        path    = []
+        r, c    = 0, 0
+        dirs    = [(0,1),(1,0),(0,-1),(-1,0)]
+        d       = 0
+        for _ in range(h * w):
+            path.append((r, c))
+            visited[r, c] = True
+            nr, nc = r + dirs[d][0], c + dirs[d][1]
+            if not (0 <= nr < h and 0 <= nc < w) or visited[nr, nc]:
+                d      = (d + 1) % 4
+                nr, nc = r + dirs[d][0], c + dirs[d][1]
+            if not (0 <= nr < h and 0 <= nc < w) or visited[nr, nc]:
+                break
+            r, c = nr, nc
+        return path
+
+
+    def spiral_fill(self, g, color):
+        """
+        Fill the grid with concentric rectangular rings of `color` separated
+        by single-cell gaps, following the spiral path from the top-left corner.
+
+        The spiral path is divided into arms (each straight run before a turn).
+        Every 4 arms = 1 ring.  Even-numbered rings (0, 2, 4 ...) are filled;
+        odd-numbered rings are left as background (the gap rows/cols).
+        This exactly matches the ARC spiral pattern where the outermost border
+        is filled, then a 1-cell gap, then the next border, etc.
+        """
+        h, w  = g.shape
+        path  = self._spiral_path(h, w)
+        out   = g.copy()
+
+        if len(path) < 2:
+            return out
+
+        # find arm boundaries (indices where direction changes)
+        arm_starts = [0]
+        prev_d = (path[1][0] - path[0][0], path[1][1] - path[0][1])
+        for i in range(1, len(path) - 1):
+            d = (path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+            if d != prev_d:
+                arm_starts.append(i)
+                prev_d = d
+        arm_starts.append(len(path))
+
+        # fill even rings (groups of 4 arms), skip odd rings
+        for arm_idx in range(len(arm_starts) - 1):
+            ring = arm_idx // 4
+            if ring % 2 == 0:
+                for i in range(arm_starts[arm_idx], arm_starts[arm_idx + 1]):
+                    r, c = path[i]
+                    out[r, c] = color
+
+        return out
+
+
+    def _build_diagonal_x_candidates(self, arc_problem):
+        """
+        Score diagonal-X fill for every non-background color found in
+        training outputs, plus a version that uses each cell's own color.
+        """
+        candidates = []
+
+        # variant 1: keep each source cell's own color along its diagonals
+        def diag_own_color(g):
+            return self.diagonal_x_fill(g)
+        diag_own_color.__name__ = "diagonal_x_own_color"
+        candidates.append(diag_own_color)
+
+        # variant 2+: flood all diagonals with a single inferred output color
+        fill_colors = set()
+        for ex in arc_problem._training_data:
+            out_g = np.array(ex._output._arc_array)
+            bg    = self.detect_background(out_g)
+            for v in np.unique(out_g):
+                if v != bg:
+                    fill_colors.add(int(v))
+
+        for fc in sorted(fill_colors):
+            def make_t(c):
+                def t(g):
+                    bg2 = self.detect_background(g)
+                    out = g.copy()
+                    h, w = g.shape
+                    for r in range(h):
+                        for c2 in range(w):
+                            if g[r, c2] == bg2:
+                                continue
+                            for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+                                nr, nc = r+dr, c2+dc
+                                while 0<=nr<h and 0<=nc<w:
+                                    if out[nr,nc] == bg2:
+                                        out[nr,nc] = c
+                                    nr+=dr; nc+=dc
+                    return out
+                t.__name__ = f"diagonal_x_fill{c}"
+                return t
+            candidates.append(make_t(fc))
+
+        return candidates
+
+
+    def _build_spiral_candidates(self, arc_problem):
+        """
+        Score spiral fill for every non-background color found in
+        training outputs.
+        """
+        fill_colors = set()
+        for ex in arc_problem._training_data:
+            out_g = np.array(ex._output._arc_array)
+            bg    = self.detect_background(out_g)
+            for v in np.unique(out_g):
+                if v != bg:
+                    fill_colors.add(int(v))
+
+        if not fill_colors:
+            fill_colors = {1}
+
+        candidates = []
+        for fc in sorted(fill_colors):
+            def make_t(c):
+                def t(g):
+                    return self.spiral_fill(g, c)
+                t.__name__ = f"spiral_fill{c}"
+                return t
+            candidates.append(make_t(fc))
+
+        return candidates
+
 
     def invert_majority_color(self, g):
         v, c  = np.unique(g, return_counts=True)
