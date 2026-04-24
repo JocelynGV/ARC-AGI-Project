@@ -85,6 +85,7 @@ class ArcAgent:
             self.hollow_objects,
             self.trim_and_flip_colors,
             self.swap_gray_and_color,
+            self.color_count_columns,
         ]
 
         color_flip = self.build_dynamic_color_flip(arc_problem)
@@ -213,6 +214,22 @@ class ArcAgent:
         # =====================================================
 
         for t in self._build_expand_dots_candidates(arc_problem):
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
+        # COLOR COUNT COLUMNS
+        # =====================================================
+
+        score = self.score_transform_on_training(
+            self.color_count_columns, arc_problem)
+        transform_scores.append((self.color_count_columns, score))
+
+        # =====================================================
+        # MULTI-PANEL PRIORITY MERGE
+        # =====================================================
+
+        for t in self._build_multi_panel_candidates(arc_problem):
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
@@ -2002,6 +2019,191 @@ class ArcAgent:
         # colored cells → 0 (already 0 from np.zeros_like)
         return out
 
+
+    # ============================================================
+    # COLOR COUNT COLUMNS
+    # ============================================================
+
+    def color_count_columns(self, grid):
+        """
+        Count occurrences of each non-background color.
+        Output: one column per color, sorted descending by count.
+        Each column is filled top-down with that color for `count` rows,
+        then 0 (black) for the remaining rows.
+        Height = count of most frequent color.
+        Width  = number of distinct non-bg colors.
+        """
+        # always use 0 as background — output empty cells are always 0
+        bg = 0
+        vals, counts = np.unique(grid, return_counts=True)
+        color_counts = sorted(
+            [(int(v), int(c)) for v,c in zip(vals,counts) if v != bg],
+            key=lambda x: -x[1]
+        )
+        if not color_counts:
+            return grid.copy()
+
+        max_count = color_counts[0][1]
+        n_cols    = len(color_counts)
+        out       = np.zeros((max_count, n_cols), dtype=grid.dtype)
+
+        for col_idx, (color, count) in enumerate(color_counts):
+            out[:count, col_idx] = color
+
+        return out
+
+
+    # ============================================================
+    # MULTI-PANEL DETECTION & PRIORITY MERGE
+    # ============================================================
+
+    def find_all_separators(self, grid):
+        """
+        Find ALL full-span uniform non-background, non-dominant column
+        separators, or row separators if no column separators exist.
+        The dominant foreground color is excluded to avoid mistaking
+        a panel column that happens to be all one color for a separator.
+        Returns list of {'axis','index','color'} dicts.
+        """
+        bg   = self.detect_background(grid)
+        h, w = grid.shape
+        seps = []
+
+        # find all full-height uniform non-bg column candidates
+        candidates = []
+        for c in range(w):
+            col   = grid[:, c]
+            color = int(col[0])
+            if color != bg and np.all(col == color):
+                candidates.append({'axis': 'col', 'index': c, 'color': color})
+
+        if candidates:
+            # pick the separator color: prefer the color appearing most times
+            # as a full-column (e.g. 2 occurrences of color-2 beats 1 of color-4)
+            from collections import Counter
+            color_freq = Counter(c['color'] for c in candidates)
+            # tie-break: least frequent overall in the grid
+            vals2, counts2 = np.unique(grid, return_counts=True)
+            grid_freq = dict(zip(vals2.tolist(), counts2.tolist()))
+            best_color = max(color_freq, key=lambda c: (color_freq[c], -grid_freq.get(c, 0)))
+            seps = [c for c in candidates if c['color'] == best_color]
+
+        # rows only if no column seps found
+        if not seps:
+            row_candidates = []
+            for r in range(h):
+                row   = grid[r, :]
+                color = int(row[0])
+                if color != bg and np.all(row == color):
+                    row_candidates.append({'axis': 'row', 'index': r, 'color': color})
+            if row_candidates:
+                from collections import Counter
+                color_freq = Counter(c['color'] for c in row_candidates)
+                vals2, counts2 = np.unique(grid, return_counts=True)
+                grid_freq = dict(zip(vals2.tolist(), counts2.tolist()))
+                best_color = max(color_freq, key=lambda c: (color_freq[c], -grid_freq.get(c, 0)))
+                seps = [c for c in row_candidates if c['color'] == best_color]
+
+        return seps
+
+
+    def split_into_all_panels(self, grid):
+        """
+        Split grid into all panels separated by uniform separator lines.
+        Returns (axis, [panel_array, ...]) or (None, []) if none found.
+        """
+        seps = self.find_all_separators(grid)
+        if not seps:
+            return None, []
+
+        bg   = self.detect_background(grid)
+        axis = seps[0]['axis']
+        indices = sorted([s['index'] for s in seps if s['axis'] == axis])
+
+        panels, prev = [], 0
+        for idx in indices:
+            p = grid[:, prev:idx] if axis == 'col' else grid[prev:idx, :]
+            if p.size > 0:
+                panels.append(p)
+            prev = idx + 1
+
+        p = grid[:, prev:] if axis == 'col' else grid[prev:, :]
+        if p.size > 0:
+            panels.append(p)
+
+        return axis, panels
+
+
+    def panel_priority_merge(self, grid):
+        """
+        Split into 2 or 3 panels, then merge using priority:
+        start with panel 1 as the base output; for each subsequent panel,
+        copy its non-background cells into any cell that is still background
+        in the output.  Panels are ordered left-to-right (or top-to-bottom).
+        """
+        bg     = self.detect_background(grid)
+        axis, panels = self.split_into_all_panels(grid)
+
+        if not panels or len(panels) < 2:
+            return grid
+
+        min_h = min(p.shape[0] for p in panels)
+        min_w = min(p.shape[1] for p in panels)
+        panels = [p[:min_h, :min_w] for p in panels]
+
+        out = panels[0].copy()
+        for panel in panels[1:]:
+            mask      = (out == bg) & (panel != bg)
+            out[mask] = panel[mask]
+
+        return out
+
+
+    def _build_multi_panel_candidates(self, arc_problem):
+        """
+        Build panel_priority_merge candidates when 2+ separators are detected.
+        Also adds the existing 2-panel ops (overlap/xor/and/neither) applied
+        to the multi-panel split so all are scored together.
+        """
+        has_multi = any(
+            len(self.find_all_separators(np.array(ex._input._arc_array))) >= 2
+            for ex in arc_problem._training_data
+        )
+        has_any = any(
+            len(self.find_all_separators(np.array(ex._input._arc_array))) >= 1
+            for ex in arc_problem._training_data
+        )
+
+        if not has_any:
+            return []
+
+        candidates = []
+
+        # priority merge (works for 2 or 3 panels)
+        def priority_merge(grid):
+            return self.panel_priority_merge(grid)
+        priority_merge.__name__ = "panel_priority_merge"
+        candidates.append(priority_merge)
+
+        # reverse priority (start from last panel)
+        def priority_merge_rev(grid):
+            bg = self.detect_background(grid)
+            _, panels = self.split_into_all_panels(grid)
+            if not panels or len(panels) < 2:
+                return grid
+            min_h = min(p.shape[0] for p in panels)
+            min_w = min(p.shape[1] for p in panels)
+            panels = [p[:min_h,:min_w] for p in panels]
+            panels = panels[::-1]
+            out = panels[0].copy()
+            for panel in panels[1:]:
+                mask = (out == bg) & (panel != bg)
+                out[mask] = panel[mask]
+            return out
+        priority_merge_rev.__name__ = "panel_priority_merge_reversed"
+        candidates.append(priority_merge_rev)
+
+        return candidates
 
     # ============================================================
     # SCORING HELPERS
