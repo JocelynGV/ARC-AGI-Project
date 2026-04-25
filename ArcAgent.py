@@ -244,6 +244,19 @@ class ArcAgent:
             transform_scores.append((t, score))
 
         # =====================================================
+        # DIAGONAL TAILS + MOVE CLOSER + BOX+DOTTED
+        # =====================================================
+
+        for t in [self.diagonal_tails,
+                  self.diagonal_tails_swapped,
+                  self.move_closer,
+                  self.move_closer_second,
+                  self.box_and_dotted_line,
+                  self.crop_and_recolor_markers]:
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        # =====================================================
         # NOISE-STRIPPED VARIANTS OF CLOSE CANDIDATES
         # =====================================================
 
@@ -2204,6 +2217,282 @@ class ArcAgent:
         candidates.append(priority_merge_rev)
 
         return candidates
+
+    # ============================================================
+    # DIAGONAL TAILS FROM TWO OBJECTS
+    # ============================================================
+
+    def diagonal_tails(self, grid, swap=False):
+        """
+        Find two non-bg objects. The first (scan-order) gets an ↖ tail
+        extending diagonally up-left from its top-left corner.
+        The second gets a ↘ tail extending down-right from its bottom-right corner.
+        swap=True reverses the assignment.
+        """
+        bg   = self.detect_background(grid)
+        h, w = grid.shape
+        out  = grid.copy()
+        dirs4 = [(-1,0),(1,0),(0,-1),(0,1)]
+        visited = np.zeros((h,w), dtype=bool)
+        objs = []
+
+        for r in range(h):
+            for c in range(w):
+                if visited[r,c] or grid[r,c] == bg:
+                    continue
+                color = grid[r,c]
+                q = deque([(r,c)]); visited[r,c] = True; cells = []
+                while q:
+                    cr,cc = q.popleft(); cells.append((cr,cc))
+                    for dr,dc in dirs4:
+                        nr,nc = cr+dr,cc+dc
+                        if (0<=nr<h and 0<=nc<w and not visited[nr,nc]
+                                and grid[nr,nc]==color):
+                            visited[nr,nc]=True; q.append((nr,nc))
+                rows2=[r2 for r2,c2 in cells]; cols2=[c2 for r2,c2 in cells]
+                objs.append({'color':color,'cells':cells,
+                             'min_r':min(rows2),'max_r':max(rows2),
+                             'min_c':min(cols2),'max_c':max(cols2)})
+
+        if len(objs) < 2:
+            return out
+
+        if swap:
+            objs = [objs[1], objs[0]]
+
+        obj_tl, obj_br = objs[0], objs[1]
+
+        # ↖ tail from top-left corner of obj_tl
+        r, c = obj_tl['min_r']-1, obj_tl['min_c']-1
+        while 0 <= r < h and 0 <= c < w:
+            if out[r,c] == bg:
+                out[r,c] = obj_tl['color']
+            r -= 1; c -= 1
+
+        # ↘ tail from bottom-right corner of obj_br
+        r, c = obj_br['max_r']+1, obj_br['max_c']+1
+        while 0 <= r < h and 0 <= c < w:
+            if out[r,c] == bg:
+                out[r,c] = obj_br['color']
+            r += 1; c += 1
+
+        return out
+
+    def diagonal_tails_swapped(self, grid):
+        return self.diagonal_tails(grid, swap=True)
+
+
+    # ============================================================
+    # MOVE CLOSER
+    # ============================================================
+
+    def move_closer(self, grid, move_first=True):
+        """
+        Find exactly two non-bg single cells.
+        Move one of them one step toward the other:
+          move_first=True  → move the first cell (scan order) toward the second
+          move_first=False → move the second cell toward the first
+        Direction is determined by sign of (target - source) on each axis.
+        """
+        bg   = self.detect_background(grid)
+        h, w = grid.shape
+        cells = [(r,c,int(grid[r,c]))
+                 for r in range(h) for c in range(w)
+                 if grid[r,c] != bg]
+
+        if len(cells) != 2:
+            return grid.copy()
+
+        (r1,c1,col1), (r2,c2,col2) = cells
+        dr = int(np.sign(r2-r1))
+        dc = int(np.sign(c2-c1))
+
+        out = grid.copy()
+        if move_first:
+            out[r1,c1]       = bg
+            out[r1+dr,c1+dc] = col1
+        else:
+            out[r2,c2]       = bg
+            out[r2-dr,c2-dc] = col2
+
+        return out
+
+    def move_closer_second(self, grid):
+        return self.move_closer(grid, move_first=False)
+
+
+    # ============================================================
+    # BOX AROUND CELLS + DOTTED LINE
+    # ============================================================
+
+    def box_and_dotted_line(self, grid):
+        """
+        For each non-bg single cell, draw a 3x3 box of the OTHER color around it
+        (center cell keeps its original color).
+        Then draw a gray (color 5) dotted line between every pair of boxes:
+          - Horizontal pairs: every other cell across the gap, starting from
+            the left box's right edge+1, step 2.
+          - Vertical pairs: every other cell from both ends of the gap meeting
+            at the midpoint, leaving the middle cells empty.
+        """
+        bg   = self.detect_background(grid)
+        gray = 5
+        h, w = grid.shape
+        out  = grid.copy()
+
+        cells  = [(r,c,int(grid[r,c]))
+                  for r in range(h) for c in range(w)
+                  if grid[r,c] != bg]
+        colors = list(set(v for _,_,v in cells))
+
+        # draw 3x3 boxes
+        for r,c,color in cells:
+            other = [col for col in colors if col != color][0]                     if len(colors) == 2 else color
+            for dr in [-1,0,1]:
+                for dc in [-1,0,1]:
+                    nr,nc = r+dr,c+dc
+                    if 0<=nr<h and 0<=nc<w and (dr!=0 or dc!=0):
+                        out[nr,nc] = other
+
+        # draw dotted lines between every pair
+        for i,(r1,c1,_) in enumerate(cells):
+            for j,(r2,c2,_) in enumerate(cells):
+                if j <= i:
+                    continue
+                if r1 == r2:
+                    # horizontal dotted
+                    left  = min(c1,c2)+2
+                    right = max(c1,c2)-2
+                    c = left
+                    while c <= right:
+                        if 0<=r1<h and 0<=c<w and out[r1,c]==bg:
+                            out[r1,c] = gray
+                        c += 2
+                elif c1 == c2:
+                    # vertical dotted — from both ends
+                    top    = min(r1,r2)+2
+                    bottom = max(r1,r2)-2
+                    if top > bottom:
+                        continue
+                    mid = (top+bottom)//2
+                    r = top
+                    while r <= mid:
+                        if 0<=r<h and out[r,c1]==bg:
+                            out[r,c1] = gray
+                        r += 2
+                    r = bottom
+                    while r > mid:
+                        if 0<=r<h and out[r,c1]==bg:
+                            out[r,c1] = gray
+                        r -= 2
+
+        return out
+
+    # ============================================================
+    # CROP AND RECOLOR BY 4 MARKER CELLS
+    # ============================================================
+
+    def crop_and_recolor_markers(self, grid):
+        """
+        Find the color that appears exactly 4 times in the grid.
+        If those 4 cells form the corners of a rectangle, crop the grid
+        to the interior of that rectangle (exclusive of the marker rows/cols)
+        and recolor all non-background cells inside to the marker color.
+        Returns the original grid unchanged if no valid marker rectangle found.
+        """
+        bg = self.detect_background(grid)
+        h, w = grid.shape
+
+        # find color that appears exactly 4 times
+        vals, counts = np.unique(grid, return_counts=True)
+        marker_color = None
+        for v, c in zip(vals, counts):
+            if int(v) != bg and int(c) == 4:
+                marker_color = int(v)
+                break
+
+        if marker_color is None:
+            return grid.copy()
+
+        positions = [(r, c) for r in range(h) for c in range(w)
+                     if grid[r, c] == marker_color]
+
+        rows = sorted(set(r for r, c in positions))
+        cols = sorted(set(c for r, c in positions))
+
+        # must be exactly 2 distinct rows and 2 distinct cols
+        if len(rows) != 2 or len(cols) != 2:
+            return grid.copy()
+
+        # all 4 corners must be present
+        expected = {(rows[0], cols[0]), (rows[0], cols[1]),
+                    (rows[1], cols[0]), (rows[1], cols[1])}
+        if set(positions) != expected:
+            return grid.copy()
+
+        # crop to interior (one cell inside each marker)
+        r1, r2 = rows[0] + 1, rows[1] - 1
+        c1, c2 = cols[0] + 1, cols[1] - 1
+
+        if r1 > r2 or c1 > c2:
+            return grid.copy()
+
+        interior = grid[r1:r2+1, c1:c2+1].copy()
+        interior[interior != bg] = marker_color
+
+        return interior
+
+    # ============================================================
+    # 4-MARKER RECTANGLE CROP + RECOLOR
+    # ============================================================
+
+    def crop_and_recolor_markers(self, grid):
+        """
+        Find a color with exactly 4 cells forming a perfect rectangle
+        (2 distinct rows × 2 distinct cols, all 4 corners present).
+        Crop to the region INSIDE those 4 markers (exclusive).
+        Recolor every non-background cell inside with the marker color.
+        """
+        from collections import defaultdict
+        bg   = self.detect_background(grid)
+        h, w = grid.shape
+
+        all_cells = [
+            (r, c, int(grid[r,c]))
+            for r in range(h) for c in range(w)
+            if grid[r,c] != bg
+        ]
+
+        by_color = defaultdict(list)
+        for r, c, v in all_cells:
+            by_color[v].append((r, c))
+
+        marker_color = r1 = r2 = c1 = c2 = None
+
+        for color, coords in by_color.items():
+            if len(coords) != 4:
+                continue
+            rows = sorted(set(r for r, c in coords))
+            cols = sorted(set(c for r, c in coords))
+            if len(rows) != 2 or len(cols) != 2:
+                continue
+            expected = {
+                (rows[0], cols[0]), (rows[0], cols[1]),
+                (rows[1], cols[0]), (rows[1], cols[1]),
+            }
+            if set(coords) == expected:
+                marker_color = color
+                r1, r2 = rows
+                c1, c2 = cols
+                break
+
+        if marker_color is None:
+            return grid.copy()
+
+        inner = grid[r1+1:r2, c1+1:c2].copy()
+        out   = inner.copy()
+        out[inner != bg] = marker_color
+        return out
 
     # ============================================================
     # SCORING HELPERS
