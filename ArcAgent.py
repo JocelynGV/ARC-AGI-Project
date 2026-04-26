@@ -252,7 +252,16 @@ class ArcAgent:
                   self.move_closer,
                   self.move_closer_second,
                   self.box_and_dotted_line,
-                  self.crop_and_recolor_markers]:
+                  self.crop_and_recolor_markers,
+                  self.connect_unique_cells_additive,
+                  self.panel_color_count_histogram,
+                  self.triangle_expand,
+                  self.tile_rotations_3x3,
+                  self.count_interior_cells_3x3]:
+            score = self.score_transform_on_training(t, arc_problem)
+            transform_scores.append((t, score))
+
+        for t in self._build_connect_diamond_candidates(arc_problem):
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
@@ -2493,6 +2502,269 @@ class ArcAgent:
         out   = inner.copy()
         out[inner != bg] = marker_color
         return out
+
+    # ============================================================
+    # CONNECT DIAMOND SHAPES WITH COLORED LINES
+    # ============================================================
+
+    def find_diamond_groups(self, grid, bg=None):
+        """
+        Detect diamond (+ shaped) patterns: 4 same-color cells at N/S/E/W
+        of a background center cell. Returns list of group dicts.
+        """
+        if bg is None: bg = self.detect_background(grid)
+        h,w = grid.shape; groups=[]; checked=set()
+        for r in range(1,h-1):
+            for c in range(1,w-1):
+                if grid[r,c] != bg: continue
+                neighbors=[(r-1,c),(r+1,c),(r,c-1),(r,c+1)]
+                colors=[int(grid[nr,nc]) for nr,nc in neighbors]
+                if any(cv==bg for cv in colors) or len(set(colors))!=1: continue
+                key=frozenset(neighbors)
+                if key in checked: continue
+                checked.add(key)
+                color=colors[0]
+                rows=[nr for nr,nc in neighbors]; cols=[nc for nr,nc in neighbors]
+                groups.append({'color':color,'cells':list(neighbors),
+                               'center_r':r,'center_c':c,
+                               'min_r':min(rows),'max_r':max(rows),
+                               'min_c':min(cols),'max_c':max(cols)})
+        return groups
+
+    def connect_diamond_shapes(self, grid, line_color=1):
+        """
+        Find diamond (+ shaped) objects. Connect those sharing the same
+        center row (horizontally) or center column (vertically) with a line
+        of `line_color` between their bounding boxes.
+        """
+        from collections import defaultdict
+        bg  = self.detect_background(grid)
+        h,w = grid.shape
+        out = grid.copy()
+        groups = self.find_diamond_groups(grid, bg)
+
+        by_row = defaultdict(list); by_col = defaultdict(list)
+        for g2 in groups:
+            by_row[g2['center_r']].append(g2)
+            by_col[g2['center_c']].append(g2)
+
+        for row, row_grps in by_row.items():
+            if len(row_grps) < 2: continue
+            row_grps.sort(key=lambda x: x['center_c'])
+            for i in range(len(row_grps)-1):
+                o1,o2 = row_grps[i], row_grps[i+1]
+                for c in range(o1['max_c']+1, o2['min_c']):
+                    if out[row,c]==bg: out[row,c]=line_color
+
+        for col, col_grps in by_col.items():
+            if len(col_grps) < 2: continue
+            col_grps.sort(key=lambda x: x['center_r'])
+            for i in range(len(col_grps)-1):
+                o1,o2 = col_grps[i], col_grps[i+1]
+                for r in range(o1['max_r']+1, o2['min_r']):
+                    if out[r,col]==bg: out[r,col]=line_color
+
+        return out
+
+    def _build_connect_diamond_candidates(self, arc_problem):
+        """Try each output color as the line color for diamond connections."""
+        has_diamonds = any(
+            len(self.find_diamond_groups(np.array(ex._input._arc_array))) >= 2
+            for ex in arc_problem._training_data
+        )
+        if not has_diamonds: return []
+        fill_colors = set()
+        for ex in arc_problem._training_data:
+            out_g=np.array(ex._output._arc_array)
+            bg=self.detect_background(out_g)
+            in_g=np.array(ex._input._arc_array)
+            for v in np.unique(out_g):
+                if v!=bg and v not in np.unique(in_g): fill_colors.add(int(v))
+        if not fill_colors: fill_colors={1}
+        candidates=[]
+        for c in sorted(fill_colors):
+            def make_t(lc):
+                def t(grid): return self.connect_diamond_shapes(grid,lc)
+                t.__name__=f"connect_diamonds_color{lc}"
+                return t
+            candidates.append(make_t(c))
+        return candidates
+
+
+    # ============================================================
+    # PANEL COLOR COUNT HISTOGRAM
+    # ============================================================
+
+    def panel_color_count_histogram(self, grid):
+        """
+        Grid divided by separator color (8 or similar).
+        Count non-separator, non-bg unique colored cells per panel.
+        Divide by the panel cell size (most common non-bg cell count = panel size).
+        Output: rows = distinct colors sorted by count ascending,
+                cols = count of that color, rest = 0.
+        """
+        from collections import Counter
+        bg  = self.detect_background(grid)
+        sep = self.find_separator(grid)
+        sep_color = sep['color'] if sep else 8
+
+        vals = grid[(grid!=bg) & (grid!=sep_color)]
+        if vals.size == 0: return grid.copy()
+
+        color_counts = Counter(vals.tolist())
+        # find panel size = most common cell count per color (usually 4 for 2x2 panels)
+        panel_size = min(color_counts.values())
+        # round each count to nearest multiple of panel_size
+        panel_counts = {k: max(1, v//panel_size) for k,v in color_counts.items()}
+
+        sorted_colors = sorted(panel_counts.items(), key=lambda x: x[1])
+        n_colors  = len(sorted_colors)
+        max_count = max(v for _,v in sorted_colors)
+
+        out = np.zeros((n_colors, max_count), dtype=grid.dtype)
+        for i,(color,count) in enumerate(sorted_colors):
+            out[i,:count] = color
+        return out
+
+
+    # ============================================================
+    # CONNECT UNIQUE CELLS ADDITIVE
+    # ============================================================
+
+    def connect_unique_cells_additive(self, grid):
+        """
+        Find exactly two non-majority, non-bg cells.
+        Draw a straight line (H/V/diagonal) between them.
+        Where the line crosses the majority color: set cell = line_color + majority.
+        Where it crosses bg or other: set cell = line_color.
+        """
+        bg  = self.detect_background(grid)
+        h,w = grid.shape
+        vals,counts = np.unique(grid,return_counts=True)
+        non_bg = [(int(v),int(c)) for v,c in zip(vals,counts) if v!=bg]
+        if not non_bg: return grid.copy()
+        majority = max(non_bg, key=lambda x:x[1])[0]
+
+        unique_cells = [(r,c,int(grid[r,c])) for r in range(h) for c in range(w)
+                        if grid[r,c]!=bg and grid[r,c]!=majority]
+        if len(unique_cells)!=2: return grid.copy()
+
+        (r1,c1,col1),(r2,c2,col2) = unique_cells
+        line_color = col1
+        dr=int(np.sign(r2-r1)); dc=int(np.sign(c2-c1))
+
+        out = grid.copy()
+        r,c = r1+dr, c1+dc
+        while (r,c)!=(r2,c2):
+            cell_val=int(grid[r,c])
+            out[r,c] = line_color+majority if cell_val==majority else line_color
+            r+=dr; c+=dc
+        return out
+
+
+    # ============================================================
+    # TRIANGLE EXPAND (1×N → N×N with dotted parallels)
+    # ============================================================
+
+    def triangle_expand(self, grid):
+        """
+        Input: 1×W with one colored cell at center_col.
+        Output: W×W with expanding triangle of tri_color + dotted
+        color-1 parallel lines at every 4 columns inside/after triangle.
+        """
+        if grid.shape[0]!=1: return grid
+        w=grid.shape[1]; h=w; bg=0
+        non_bg=[(c,int(grid[0,c])) for c in range(w) if grid[0,c]!=bg]
+        if not non_bg: return grid
+        center_col,tri_color=non_bg[0]
+        dot_color=1
+        out=np.zeros((h,w),dtype=grid.dtype)
+        out[0,center_col]=tri_color
+        for r in range(1,h):
+            left_c=center_col-r; right_c=center_col+r
+            if 0<=left_c<w:  out[r,left_c]=tri_color
+            if 0<=right_c<w: out[r,right_c]=tri_color
+            triangle_active=(0<=left_c and right_c<w)
+            for c in range(w):
+                if out[r,c]!=bg: continue
+                if (c-center_col-r)%4!=0: continue
+                if triangle_active:
+                    if left_c<c<right_c: out[r,c]=dot_color
+                else:
+                    out[r,c]=dot_color
+        return out
+
+
+    # ============================================================
+    # TILE ROTATIONS 3×3
+    # ============================================================
+
+    def tile_rotations_3x3(self, grid):
+        """
+        Tile the input in a 3×3 arrangement:
+          [rot180, flipv,  rot180]
+          [fliph,  orig,   fliph ]
+          [rot180, flipv,  rot180]
+        """
+        r180=np.rot90(grid,2); fh=np.fliplr(grid); fv=np.flipud(grid)
+        top=np.hstack([r180,fv,r180]); mid=np.hstack([fh,grid,fh])
+        bot=np.hstack([r180,fv,r180])
+        return np.vstack([top,mid,bot])
+
+
+    # ============================================================
+    # COUNT INTERIOR COLORED CELLS → 3×3 OUTPUT
+    # ============================================================
+
+    def count_interior_cells_3x3(self, grid):
+        """
+        Find the closed object (has a hole). Count non-bg colored cells inside.
+        Return a 3×3 grid filled with interior_color for count cells (top-left),
+        rest 0.
+        """
+        bg=self.detect_background(grid); h,w=grid.shape
+        dirs4=[(-1,0),(1,0),(0,-1),(0,1)]
+        visited=np.zeros((h,w),dtype=bool)
+
+        for r in range(h):
+            for c in range(w):
+                if visited[r,c] or grid[r,c]==bg: continue
+                color=grid[r,c]; q=deque([(r,c)]); visited[r,c]=True; cells=[]
+                while q:
+                    cr,cc=q.popleft(); cells.append((cr,cc))
+                    for dr,dc in dirs4:
+                        nr,nc=cr+dr,cc+dc
+                        if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and grid[nr,nc]==color:
+                            visited[nr,nc]=True; q.append((nr,nc))
+                rows2=[r2 for r2,c2 in cells]; cols2=[c2 for r2,c2 in cells]
+                min_r,max_r=min(rows2),max(rows2); min_c,max_c=min(cols2),max(cols2)
+                lh=max_r-min_r+1; lw=max_c-min_c+1
+                shape=np.zeros((lh,lw),int)
+                for r2,c2 in cells: shape[r2-min_r,c2-min_c]=color
+                vis2=np.zeros((lh,lw),bool); q2=deque()
+                for rr in range(lh):
+                    for cc2 in range(lw):
+                        if (rr in [0,lh-1] or cc2 in [0,lw-1]) and shape[rr,cc2]==0:
+                            vis2[rr,cc2]=True; q2.append((rr,cc2))
+                while q2:
+                    rr,cc2=q2.popleft()
+                    for dr,dc in dirs4:
+                        nr,nc=rr+dr,cc2+dc
+                        if 0<=nr<lh and 0<=nc<lw and not vis2[nr,nc] and shape[nr,nc]==0:
+                            vis2[nr,nc]=True; q2.append((nr,nc))
+                if not np.any((shape==0)&~vis2): continue
+                # count non-bg colored cells inside the hole
+                count=0; fill_color=None
+                for rr in range(lh):
+                    for cc2 in range(lw):
+                        if shape[rr,cc2]==0 and not vis2[rr,cc2]:
+                            v=int(grid[rr+min_r,cc2+min_c])
+                            if v!=bg: count+=1; fill_color=v
+                if fill_color is None: return grid.copy()
+                out=np.zeros((3,3),int)
+                for i in range(min(count,9)): out[i//3,i%3]=fill_color
+                return out
+        return grid.copy()
 
     # ============================================================
     # SCORING HELPERS
