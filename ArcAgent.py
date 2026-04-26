@@ -257,7 +257,12 @@ class ArcAgent:
                   self.panel_color_count_histogram,
                   self.triangle_expand,
                   self.tile_rotations_3x3,
-                  self.count_interior_cells_3x3]:
+                  self.count_interior_cells_3x3,
+                  self.border_color_move,
+                  self.triangle_tip_line,
+                  self.reflect_gray_over_object,
+                  self.connect_cells_diagonal_straight,
+                  self.recolor_with_pairs_and_trim]:
             score = self.score_transform_on_training(t, arc_problem)
             transform_scores.append((t, score))
 
@@ -2600,30 +2605,40 @@ class ArcAgent:
         Grid divided by separator color (8 or similar).
         Count non-separator, non-bg unique colored cells per panel.
         Divide by the panel cell size (most common non-bg cell count = panel size).
-        Output: rows = distinct colors sorted by count ascending,
-                cols = count of that color, rest = 0.
+        Output: rows = distinct non-majority colors sorted by count ascending,
+                cols = count of that color filled left-to-right, rest = 0.
+        The majority background color is excluded.
         """
         from collections import Counter
         bg  = self.detect_background(grid)
         sep = self.find_separator(grid)
-        sep_color = sep['color'] if sep else 8
+        sep_color = sep['color'] if sep else None
 
-        vals = grid[(grid!=bg) & (grid!=sep_color)]
+        # exclude bg and separator color
+        mask = (grid != bg)
+        if sep_color is not None:
+            mask = mask & (grid != sep_color)
+        vals = grid[mask]
         if vals.size == 0: return grid.copy()
 
+        # also exclude the dominant non-sep color (majority fg)
         color_counts = Counter(vals.tolist())
-        # find panel size = most common cell count per color (usually 4 for 2x2 panels)
+        if len(color_counts) <= 1: return grid.copy()
+        dominant = max(color_counts, key=color_counts.get)
+        color_counts.pop(dominant)
+
+        # panel size = smallest count (one panel's worth of cells)
         panel_size = min(color_counts.values())
-        # round each count to nearest multiple of panel_size
         panel_counts = {k: max(1, v//panel_size) for k,v in color_counts.items()}
 
+        # rows = colors (ascending count), cols = count (filled left), rest = 0
         sorted_colors = sorted(panel_counts.items(), key=lambda x: x[1])
-        n_colors  = len(sorted_colors)
+        n_rows    = len(sorted_colors)
         max_count = max(v for _,v in sorted_colors)
 
-        out = np.zeros((n_colors, max_count), dtype=grid.dtype)
+        out = np.zeros((n_rows, max_count), dtype=grid.dtype)
         for i,(color,count) in enumerate(sorted_colors):
-            out[i,:count] = color
+            out[i, :count] = color
         return out
 
 
@@ -2765,6 +2780,300 @@ class ArcAgent:
                 for i in range(min(count,9)): out[i//3,i%3]=fill_color
                 return out
         return grid.copy()
+
+    # ============================================================
+    # CYCLE COLORS TO MATCH TRAINING
+    # ============================================================
+
+    def cycle_color_match(self, grid, arc_problem=None):
+        """
+        If fewer than 4 colors present, try replacing each non-bg color
+        with every ARC color 0-9. Score each candidate against training output.
+        Return the highest-scoring replacement.
+        """
+        bg   = self.detect_background(grid)
+        vals = [int(v) for v in np.unique(grid) if v != bg]
+        if len(vals) >= 4 or arc_problem is None:
+            return grid.copy()
+
+        best_score  = -1
+        best_result = grid.copy()
+
+        for target_color in vals:
+            for new_color in range(10):
+                if new_color == target_color:
+                    continue
+                candidate = grid.copy()
+                candidate[grid == target_color] = new_color
+                score = self.score_transform_on_training(
+                    lambda g, _c=candidate: _c, arc_problem)
+                # Direct scoring: compare candidate to each training output
+                s = 0; n = 0
+                for ex in arc_problem._training_data:
+                    out_g = np.array(ex._output._arc_array)
+                    if candidate.shape == out_g.shape:
+                        s += float(np.mean(candidate == out_g))
+                        n += 1
+                if n > 0:
+                    s /= n
+                    if s > best_score:
+                        best_score  = s
+                        best_result = candidate.copy()
+
+        return best_result
+
+
+    # ============================================================
+    # BORDER-COLOR CELL MOVEMENT
+    # ============================================================
+
+    def border_color_move(self, grid):
+        """
+        Detect 4 border colors (top, bottom, left, right row/col).
+        Move each interior cell to be adjacent to the border of matching color.
+        Interior cells with no matching border are removed.
+        """
+        bg  = self.detect_background(grid)
+        h,w = grid.shape
+        out = np.full_like(grid, bg)
+
+        # detect border colors from the first/last row/col
+        top_color    = int(grid[0, w//2])      if grid[0, w//2] != bg else None
+        bottom_color = int(grid[h-1, w//2])    if grid[h-1, w//2] != bg else None
+        left_color   = int(grid[h//2, 0])      if grid[h//2, 0] != bg else None
+        right_color  = int(grid[h//2, w-1])    if grid[h//2, w-1] != bg else None
+
+        # copy borders unchanged
+        out[0, :]   = grid[0, :]
+        out[h-1, :] = grid[h-1, :]
+        out[:, 0]   = grid[:, 0]
+        out[:, w-1] = grid[:, w-1]
+
+        # move interior cells
+        for r in range(1, h-1):
+            for c in range(1, w-1):
+                v = int(grid[r, c])
+                if v == bg:
+                    continue
+                if v == top_color:
+                    # move to row 1 (adjacent to top border), same col
+                    out[1, c] = v
+                elif v == bottom_color:
+                    # move to row h-2 (adjacent to bottom border), same col
+                    out[h-2, c] = v
+                elif v == left_color:
+                    # move to col 1 (adjacent to left border), same row
+                    out[r, 1] = v
+                elif v == right_color:
+                    # move to col w-2 (adjacent to right border), same row
+                    out[r, w-2] = v
+                # else: no matching border → removed (stays bg)
+
+        return out
+
+
+    # ============================================================
+    # TRIANGLE TIP LINE
+    # ============================================================
+
+    def triangle_tip_line(self, grid):
+        """
+        Find a triangular object (widths monotonically change row by row).
+        Shoot a line of the LEAST common color in the object outward from the tip.
+        """
+        bg   = self.detect_background(grid)
+        h,w  = grid.shape
+        objs = self.find_objects(grid)
+        out  = grid.copy()
+
+        for obj in objs:
+            rows = sorted(set(r for r,c in obj.cells))
+            if len(rows) < 3:
+                continue
+            widths = [sum(1 for r2,c2 in obj.cells if r2==row) for row in rows]
+            # detect monotonic narrowing
+            if widths == sorted(widths):
+                tip_row = rows[0]    # narrows upward, tip at top
+                tip_col = int(np.mean([c for r2,c2 in obj.cells if r2==tip_row for c in [c2]]))
+                dr, dc  = -1, 0
+            elif widths == sorted(widths, reverse=True):
+                tip_row = rows[-1]   # narrows downward, tip at bottom
+                tip_col = int(np.mean([c for r2,c2 in obj.cells if r2==tip_row for c in [c2]]))
+                dr, dc  = 1, 0
+            else:
+                continue
+
+            # least common non-bg color in the object's bounding box
+            from collections import Counter
+            bbox_cells = [int(grid[rr,cc])
+                          for rr in range(obj.min_row, obj.max_row+1)
+                          for cc in range(obj.min_col, obj.max_col+1)
+                          if grid[rr,cc] != bg]
+            color_counts = Counter(bbox_cells)
+            line_color   = min(color_counts, key=color_counts.get)
+
+            # shoot line from just past the tip
+            r, c = tip_row + dr, tip_col + dc
+            while 0 <= r < h and 0 <= c < w:
+                if out[r, c] == bg:
+                    out[r, c] = line_color
+                r += dr; c += dc
+
+        return out
+
+
+    # ============================================================
+    # REFLECT GRAY OBJECT OVER ANOTHER OBJECT
+    # ============================================================
+
+    def reflect_gray_over_object(self, grid, gray_color=5):
+        """
+        Find gray (color 5) objects inside another object.
+        Reflect each gray cell over the nearest border of the enclosing object.
+        Remove the original gray cells from inside.
+        """
+        bg  = self.detect_background(grid)
+        h,w = grid.shape
+        out = grid.copy()
+        objs = self.find_objects(grid)
+
+        # compute combined bounding box of all non-gray, non-bg objects
+        frame_objs = [o for o in objs if o.color != gray_color and o.color != bg]
+        if not frame_objs:
+            return out
+
+        top    = min(o.min_row for o in frame_objs)
+        bottom = max(o.max_row for o in frame_objs)
+        left   = min(o.min_col for o in frame_objs)
+        right  = max(o.max_col for o in frame_objs)
+
+        # reflect each gray object as a unit over its nearest frame border
+        gray_objs = [o for o in objs if o.color == gray_color]
+
+        for gray_obj in gray_objs:
+            cells = gray_obj.cells
+            rows  = [r for r,c in cells]
+            cols  = [c for r,c in cells]
+            obj_cr = sum(rows)/len(rows)
+            obj_cc = sum(cols)/len(cols)
+
+            # distance from object center to each frame border
+            d_top    = abs(obj_cr - top)
+            d_bottom = abs(obj_cr - bottom)
+            d_left   = abs(obj_cc - left)
+            d_right  = abs(obj_cc - right)
+
+            min_d = min(d_top, d_bottom, d_left, d_right)
+
+            for r, c in cells:
+                out[r, c] = bg   # remove original
+
+                if min_d == d_top:
+                    nr, nc = top - (r - top), c
+                elif min_d == d_bottom:
+                    nr, nc = bottom + (bottom - r), c
+                elif min_d == d_left:
+                    nr, nc = r, left - (c - left)
+                else:
+                    nr, nc = r, right + (right - c)
+
+                if 0 <= nr < h and 0 <= nc < w:
+                    out[nr, nc] = gray_color
+
+        return out
+
+
+    # ============================================================
+    # CONNECT TWO SINGLE CELLS: DIAGONAL THEN STRAIGHT
+    # ============================================================
+
+    def connect_cells_diagonal_straight(self, grid):
+        """
+        Find exactly two non-bg single cells.
+        From the cell with the LOWER color value, draw diagonally toward
+        the other until 1 column away, then straight (same axis) to 1 step away.
+        Line color = sum of the two cell colors.
+        """
+        bg   = self.detect_background(grid)
+        h,w  = grid.shape
+        cells = [(r, c, int(grid[r,c]))
+                 for r in range(h) for c in range(w)
+                 if grid[r,c] != bg]
+
+        if len(cells) != 2:
+            return grid.copy()
+
+        (r1,c1,v1), (r2,c2,v2) = cells
+        # start from lower-valued color
+        if v1 > v2:
+            r1,c1,v1, r2,c2,v2 = r2,c2,v2, r1,c1,v1
+
+        line_color = v1 + v2
+        out = grid.copy()
+        dr = int(np.sign(r2-r1)); dc = int(np.sign(c2-c1))
+
+        r, c = r1+dr, c1+dc
+
+        # Phase 1: diagonal until 1 column away from target
+        while abs(c - c2) > 1:
+            out[r, c] = line_color
+            r += dr; c += dc
+
+        # Phase 2: straight (fix column, move row) until 1 step from target
+        while r != r2:
+            out[r, c] = line_color
+            r += dr
+
+        return out
+
+
+    # ============================================================
+    # PAIR-BASED RECOLOR OF MAIN OBJECT + TRIM
+    # ============================================================
+
+    def recolor_with_pairs_and_trim(self, grid):
+        """
+        Find the largest object (main object).
+        Find all adjacent 2-cell groups (different colors) outside the main object bbox.
+        For each pair (a, b): in the main object's subgrid, replace color max(a,b) with min(a,b).
+        Return the trimmed subgrid.
+        """
+        bg   = self.detect_background(grid)
+        h,w  = grid.shape
+        objs = self.find_objects(grid)
+
+        if not objs:
+            return grid.copy()
+
+        main_obj = max(objs, key=lambda o: o.size)
+        rows = [r for r,c in main_obj.cells]
+        cols = [c for r,c in main_obj.cells]
+        min_r, max_r = min(rows), max(rows)
+        min_c, max_c = min(cols), max(cols)
+
+        sub = grid[min_r:max_r+1, min_c:max_c+1].copy()
+
+        # find cells outside main bbox
+        outside = [(r,c,int(grid[r,c]))
+                   for r in range(h) for c in range(w)
+                   if grid[r,c] != bg
+                   and not (min_r<=r<=max_r and min_c<=c<=max_c)]
+
+        # group adjacent pairs (8-connected, distance 1)
+        used = set(); pairs = []
+        for i, (r1,c1,v1) in enumerate(outside):
+            if (r1,c1) in used: continue
+            for r2,c2,v2 in outside[i+1:]:
+                if (r2,c2) in used: continue
+                if max(abs(r2-r1), abs(c2-c1)) == 1:
+                    pairs.append((min(v1,v2), max(v1,v2)))
+                    used.add((r1,c1)); used.add((r2,c2)); break
+
+        # apply: replace old_c with new_c
+        for new_c, old_c in pairs:
+            sub[sub == old_c] = new_c
+
+        return sub
 
     # ============================================================
     # SCORING HELPERS
